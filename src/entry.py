@@ -49,7 +49,7 @@ def on_candle_closed(exchange: str, symbol: str, timeframe: str, close_time: Any
         pivot_registry=_pivot_registry,
         timeframe=TIMEFRAME,
         symbols=EXPECTED_SYMBOLS,
-        n=3,
+        n=5,
         eps=1e-9,
         strict=False,
         hit_strict=True
