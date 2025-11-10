@@ -18,14 +18,15 @@ def get_last_n_candles(
     n: int = 400
 ) -> List[Dict[str, Any]]:
     """
-    Reads from your CandleBuffer and returns list[dict] with:
+    Reads from CandleBuffer and returns list[dict] with:
     High, Low, CloseTime, OpenTime
+    (ASC order; oldest -> newest)
     """
     return candles_for_pivots(candle_buffer, exchange, symbol, timeframe, n=n)
 
 
 def update_pivot_buffers_for_symbol(
-    candle_registry,                   # kept name for compatibility; it's CandleBuffer instance
+    candle_registry,                   # CandleBuffer instance
     pivot_registry: PivotBufferRegistry,
     exchange: str,
     symbol: str,
@@ -37,8 +38,8 @@ def update_pivot_buffers_for_symbol(
     hit_strict: bool = True
 ):
     """
-    Compute pivots for one (exchange, symbol, timeframe) and append
-    new peaks/lows to PivotBufferRegistry, avoiding duplicates by time.
+    Compute pivots for one (exchange, symbol, timeframe) and merge them into the
+    PivotBufferRegistry while keeping buffers time-sorted by CLOSE time (p.time).
     """
     candles = get_last_n_candles(candle_registry, exchange, symbol, timeframe, n=400)
 
@@ -52,17 +53,27 @@ def update_pivot_buffers_for_symbol(
 
     pb = pivot_registry.get(exchange, symbol, timeframe)
 
-    # Avoid duplicates by exact time
-    existing_peak_times = {p.time for p in pb.iter_peaks_newest_first()}
-    existing_low_times  = {p.time for p in pb.iter_lows_newest_first()}
+    # ---- Merge NEW + EXISTING by CLOSE time, keep chronological order (oldest -> newest) ----
+    # Prefer NEW for the same pivot time (so hit flags/price refresh if logic updates)
+    # Peaks
+    existing_peaks_by_time = {p.time: p for p in pb.iter_peaks_newest_first()}  # newest->oldest
+    for p in peaks:  # detector typically yields oldest->newest
+        existing_peaks_by_time[p.time] = p
 
-    for p in peaks:
-        if p.time not in existing_peak_times:
-            pb.add_peak(p)
+    sorted_peak_times = sorted(existing_peaks_by_time.keys())  # oldest->newest
+    pb.highs.clear()
+    for t in sorted_peak_times:
+        pb.add_peak(existing_peaks_by_time[t])
 
+    # Lows
+    existing_lows_by_time = {q.time: q for q in pb.iter_lows_newest_first()}
     for q in lows:
-        if q.time not in existing_low_times:
-            pb.add_low(q)
+        existing_lows_by_time[q.time] = q
+
+    sorted_low_times = sorted(existing_lows_by_time.keys())  # oldest->newest
+    pb.lows.clear()
+    for t in sorted_low_times:
+        pb.add_low(existing_lows_by_time[t])
 
 
 def execute_strategy(
@@ -79,9 +90,9 @@ def execute_strategy(
 ):
     """
     Called once all required symbols have delivered the candle for `close_time`.
-    1) Update pivot buffers per symbol (using your exact pivot logic)
-    2) Print a small debug snapshot (later: real rules)
-    3) Dump full peak/low lists for a target symbol (EUR/USD by default)
+    1) Update pivot buffers per symbol
+    2) Print small debug snapshot
+    3) Dump full peak/low lists for a target symbol
     """
     print(f"[execute_strategy] close_time={close_time}", flush=True)
 
@@ -106,7 +117,7 @@ def execute_strategy(
             flush=True
         )
 
-    # 2) Per-symbol snapshot at this close_time
+    # 2) Per-symbol snapshot at this close_time (optional block kept commented)
     '''
     for (exch, sym) in symbols:
         pb = pivot_registry.get(exch, sym, timeframe)
@@ -122,28 +133,33 @@ def execute_strategy(
         )
     '''
 
-    # 3) Dump full lists for a target symbol (newest -> oldest)
+    # 3) Dump full lists for a target symbol (newest -> oldest by CLOSE time)
     target_exch = "OANDA"
     target_sym  = "GBP/USD"   # change here if you want another
 
     pb = pivot_registry.get(target_exch, target_sym, timeframe)
     print(f"\n------ All Peaks and Lows for {target_exch}:{target_sym} ({timeframe}) ------", flush=True)
 
+    # Ensure newest->oldest by CLOSE time when printing (even if buffers are already sorted)
+    peaks_list = list(pb.iter_peaks_newest_first())
+    peaks_list.sort(key=lambda p: p.time, reverse=True)
+
     print("Peaks (newest -> oldest):", flush=True)
-    printed_any = False
-    for p in pb.iter_peaks_newest_first():
-        print("  ", _fmt_pivot(p), flush=True)
-        printed_any = True
-    if not printed_any:
+    if not peaks_list:
         print("  (none)", flush=True)
+    else:
+        for p in peaks_list:
+            print("  ", _fmt_pivot(p), flush=True)
+
+    lows_list = list(pb.iter_lows_newest_first())
+    lows_list.sort(key=lambda p: p.time, reverse=True)
 
     print("Lows (newest -> oldest):", flush=True)
-    printed_any = False
-    for p in pb.iter_lows_newest_first():
-        print("  ", _fmt_pivot(p), flush=True)
-        printed_any = True
-    if not printed_any:
+    if not lows_list:
         print("  (none)", flush=True)
+    else:
+        for p in lows_list:
+            print("  ", _fmt_pivot(p), flush=True)
 
 
 def _fmt_time_min(t) -> str:
@@ -153,19 +169,18 @@ def _fmt_time_min(t) -> str:
     try:
         if isinstance(t, datetime):
             return t.strftime("%Y-%m-%d %H:%M")
-        # epoch seconds (int/float)?
         if isinstance(t, (int, float)):
             return datetime.utcfromtimestamp(int(t)).strftime("%Y-%m-%d %H:%M")
-        # ISO string or other -> best-effort slice
         s = str(t)
-        # typical ISO: 'YYYY-MM-DD HH:MM:SS' or 'YYYY-MM-DDTHH:MM:SS'
-        # take first 16 chars to get YYYY-MM-DD HH:MM
         return s.replace("T", " ")[:16]
     except Exception:
         return str(t)
 
 
 def _fmt_pivot(p: Pivot | None) -> str:
+    """
+    Print using OpenTime (as requested) but NOTE: ordering is by CLOSE time (p.time).
+    """
     if p is None:
         return "-"
     price_str = f"{p.price:.5f}" if isinstance(p.price, float) else str(p.price)

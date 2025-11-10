@@ -133,7 +133,7 @@ async def main():
 
                 except Exception as e:
                     await asyncio.sleep(0.05)
-        
+         
         logger.info(
                 json.dumps({
                             "EventCode": 0,
