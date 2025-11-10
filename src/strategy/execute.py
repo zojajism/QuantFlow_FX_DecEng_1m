@@ -135,7 +135,7 @@ def execute_strategy(
 
     # 3) Dump full lists for a target symbol (newest -> oldest by CLOSE time)
     target_exch = "OANDA"
-    target_sym  = "GBP/USD"   # change here if you want another
+    target_sym  = "EUR/USD"   # change here if you want another
 
     pb = pivot_registry.get(target_exch, target_sym, timeframe)
     print(f"\n------ All Peaks and Lows for {target_exch}:{target_sym} ({timeframe}) ------", flush=True)
@@ -184,4 +184,4 @@ def _fmt_pivot(p: Pivot | None) -> str:
     if p is None:
         return "-"
     price_str = f"{p.price:.5f}" if isinstance(p.price, float) else str(p.price)
-    return f"(open={_fmt_time_min(p.open_time)}, price={price_str}, hit={p.is_hit})"
+    return f"(close={_fmt_time_min(p.time)}, price={price_str}, hit={p.is_hit})"
