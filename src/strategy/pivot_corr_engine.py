@@ -19,6 +19,7 @@ from pivots.pivot_registry_provider import get_pivot_registry
 # Cross-trigger signal dedup
 from signals.signal_registry import get_signal_registry
 
+from telegram_notifier import notify_telegram, ChatType, start_telegram_notifier, close_telegram_notifier, ChatType
 
 # --------------------------------------------------------------------
 # Core State Classes
@@ -93,18 +94,15 @@ def run_decision_event(
 
           In other words: "3 or more hits -> trade on the remaining found-but-not-hit symbols".
 
-      • Direction (BUY/SELL):
-          - SAME/OPP groups only determine direction, not the validity of the signal.
-          - We anchor direction on ref_type (ref pivot type):
-              ref_type == "HIGH":
-                 SAME group → SELL (we are selling into a group high)
-                 OPP  group → BUY  (inverse correlation)
-              ref_type == "LOW":
-                 SAME group → BUY  (we are buying from a group low)
-                 OPP  group → SELL (inverse correlation)
+      • Direction (BUY/SELL) – NEW LOGIC:
+          - Direction is now based on the TARGET symbol's pivot type:
+              target pivot HIGH → BUY
+              target pivot LOW  → SELL
+
+        SAME/OPP groups are not used for direction any more, only for correlation.
 
       • Entry price (position_price):
-          - For now, we take the latest (most recent) candle close
+          - We take the latest (most recent) candle close
             from CandleBuffer for that (exchange, symbol, timeframe).
           - This is Option 1: simple and consistent with a 1m strategy.
           - In the future, we can switch to using Tick price as entry.
@@ -144,6 +142,7 @@ def run_decision_event(
             "open_time": datetime | None,
             "price": float,
             "hit": bool,
+            "type": "HIGH" or "LOW",
           }
         """
         key = (sym, ptype)
@@ -264,19 +263,9 @@ def run_decision_event(
                 total_hits = sum(1 for v in hit_map.values() if v)
                 confirm_syms_str = ", ".join([s for s, v in hit_map.items() if v])
 
-                # DEBUG (optional – uncomment if you want more logs)
-                # print(
-                #     f"[DEBUG] ref={ref_symbol} {ref_type} @ {pivot_time} | "
-                #     f"total_hits={total_hits} | hits=[{confirm_syms_str}]"
-                # )
-
                 # Rule: we require at least 3 hits across the basket.
                 if total_hits < 3:
-                    # Not enough confirmation; no signals for this pivot.
                     continue
-
-                # If we don't have a DB connection, we can still print signals,
-                # but we won't write them to the DB. So we do NOT early-return here.
 
                 # ----------------------------------------------------
                 # 3) For each symbol, decide if it becomes a signal target
@@ -286,11 +275,11 @@ def run_decision_event(
                     if tgt == "DXY/DXY":
                         continue
 
-                    # Determine pivot presence and hit status for target
                     tgt_found: bool
                     tgt_hit: bool
                     tgt_pivot_time: Optional[datetime]
                     tgt_pivot_price: Optional[Decimal]
+                    tgt_pivot_type: Optional[str]  # "HIGH" or "LOW"
 
                     if tgt == ref_symbol:
                         # Target is the ref itself
@@ -298,6 +287,7 @@ def run_decision_event(
                         tgt_hit = ref_hit
                         tgt_pivot_time = pivot_time
                         tgt_pivot_price = Decimal(str(ref_price))
+                        tgt_pivot_type = ref_type
                     else:
                         c = comp_by_symbol.get(tgt)
                         if not c or not c.get("found"):
@@ -306,14 +296,21 @@ def run_decision_event(
                         tgt_found = True
                         tgt_hit = bool(c["hit"])
                         tgt_pivot_time = c["time"]
-                        tgt_pivot_price = Decimal(str(c["price"])) if c["price"] is not None else None
+                        tgt_pivot_price = (
+                            Decimal(str(c["price"])) if c["price"] is not None else None
+                        )
+                        tgt_pivot_type = c.get("type")
 
                     # We only want symbols whose pivot is FOUND but NOT HIT yet
                     if (not tgt_found) or tgt_hit:
                         continue
 
-                    if tgt_pivot_time is None or tgt_pivot_price is None:
-                        # Safety check; normally pivot_time and price must exist
+                    if (
+                        tgt_pivot_time is None
+                        or tgt_pivot_price is None
+                        or tgt_pivot_type is None
+                    ):
+                        # Safety check; normally time, price and type must exist
                         continue
 
                     # ------------------------------------------------
@@ -330,9 +327,12 @@ def run_decision_event(
                         continue
 
                     # ------------------------------------------------
-                    # 5) Determine side (BUY/SELL) based on groups and ref_type
+                    # 5) Determine side (BUY/SELL) based on TARGET pivot type
                     # ------------------------------------------------
-                    side = _decide_side(ref_type, tgt, same_group, opposite_group)
+                    # Rule:
+                    #   - target pivot HIGH -> BUY
+                    #   - target pivot LOW  -> SELL
+                    side = "buy" if tgt_pivot_type == "HIGH" else "sell"
 
                     # Normalize pivot time to minute for dedup keys
                     found_at_minute = tgt_pivot_time.replace(second=0, microsecond=0)
@@ -365,8 +365,21 @@ def run_decision_event(
                         f"target_pips={target_pips} | "
                         f"confirm_symbols=[{confirm_syms_str}] | "
                         f"ref={ref_symbol} {ref_type} @ {pivot_time} | "
-                        f"pivot_time(target)={tgt_pivot_time}"
+                        f"pivot_time(target)={tgt_pivot_time} | "
+                        f"pivot_type(target)={tgt_pivot_type}"
                     )
+                    
+                    notify_telegram("⚡ Pivot Correlation Signal\n"
+                                    f"Symbol:      {tgt}\n"
+                                    f"Side:          {side.upper()}\n"
+                                    f"Entry price:   {position_price}\n"
+                                    f"Target price:  {target_price}\n"
+                                    f"Distance:      {target_pips} pips\n\n"
+                                    f"Ref pivot:     {ref_symbol}   {ref_type}\n"
+                                    f"Ref pivot time:        {pivot_time.strftime("%Y-%m-%d %H:%M")}\n\n"
+                                    f"Target pivot time:   {tgt_pivot_time.strftime("%Y-%m-%d %H:%M")}\n"
+                                    f"Event time:               {event_time.strftime("%Y-%m-%d %H:%M")}\n\n"
+                                    f"Confirm symbols:   {confirm_syms_str}", ChatType.INFO)
 
                     # 5) Queue row for signals table INSERT (if conn is available)
                     if conn is not None:
@@ -391,7 +404,6 @@ def run_decision_event(
         if batch_rows_looplog:
             _insert_pivot_loop_log(conn, batch_rows_looplog)
         if batch_rows_signals:
-            # You can comment this print out if it is too noisy
             print(batch_rows_signals)
             _insert_signals(conn, batch_rows_signals)
 
@@ -595,6 +607,7 @@ def _collect_pivots_from_registry(
             "open_time": open_time_t,
             "price": price_v,
             "hit": bool(hit_v),
+            "type": pivot_type.upper(),  # keep explicit type on dict
         })
 
         if len(out) >= max_lookback:
@@ -738,22 +751,12 @@ def _decide_side(
     opposite_group: List[str],
 ) -> str:
     """
-    Decide BUY/SELL direction for a target symbol based on:
+    OLD DIRECTION LOGIC (kept for reference, currently unused):
 
-      - ref_type: "HIGH" or "LOW"
-      - which group the target symbol belongs to (SAME or OPP)
+      - Based on ref_type + group membership.
 
-    Current rule:
-
-      If ref_type == "HIGH":
-         SAME group → SELL
-         OPP  group → BUY
-
-      If ref_type == "LOW":
-         SAME group → BUY
-         OPP  group → SELL
-
-    If a symbol is in neither list, we treat it as SAME-group for direction.
+    We no longer call this function; direction is now based solely
+    on the target symbol's pivot type (HIGH -> BUY, LOW -> SELL).
     """
     symbol_upper = symbol.upper()
 
