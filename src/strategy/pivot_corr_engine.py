@@ -371,10 +371,11 @@ def run_decision_event(
                     
                     notify_telegram("⚡ Pivot Correlation Signal\n"
                                     f"Symbol:      {tgt}\n"
-                                    f"Side:          {side.upper()}\n"
+                                    f"Side:          {side.upper()}\n\n"
                                     f"Entry price:   {position_price}\n"
                                     f"Target price:  {target_price}\n"
-                                    f"Distance:      {target_pips} pips\n\n"
+                                    f"Distance:      {target_pips}  pips\n"
+                                    f"Profit:        ${target_pips / 10000 * 5000}\n\n"
                                     f"Ref pivot:     {ref_symbol}   {ref_type}\n"
                                     f"Ref pivot time:        {pivot_time.strftime("%Y-%m-%d %H:%M")}\n\n"
                                     f"Target pivot time:   {tgt_pivot_time.strftime("%Y-%m-%d %H:%M")}\n"
