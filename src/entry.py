@@ -2,6 +2,8 @@
 
 from datetime import datetime
 from typing import List, Tuple, Any, Dict
+import threading
+
 from sync.symbol_close_gate import SymbolCloseGate
 from pivots.pivot_buffer import PivotBufferRegistry
 from pivots.pivot_registry_provider import get_pivot_registry  # <-- use shared singleton
@@ -37,12 +39,115 @@ _pivot_registry: PivotBufferRegistry = get_pivot_registry()
 _close_gate = SymbolCloseGate(expected_symbols=set(EXPECTED_SYMBOLS))
 _candle_buffer = None  # will point to your buffers.CANDLE_BUFFER
 
+
+# ---------- PivotList snapshot helpers ----------
+
+def _gather_pivot_list_rows(
+    *,
+    event_time: datetime,
+    timeframe: str,
+) -> List[tuple]:
+    """
+    Build the full rows for pivot_list at this event_time across all EXPECTED_SYMBOLS.
+    Returns list of tuples:
+      (event_time, symbol, pivot_type, pivot_time, pivot_open_time, price, hit)
+    """
+    rows: List[tuple] = []
+
+    # Build a quick map for (exchange,symbol) pairs
+    pairs: List[Tuple[str, str]] = [(ex, sym) for (ex, sym) in EXPECTED_SYMBOLS]
+
+    for exchange, symbol in pairs:
+        # HIGH pivots (newest->oldest)
+        pb = _pivot_registry.get(exchange, symbol, timeframe)
+        if pb is None:
+            continue
+
+        # Iterate highs
+        try:
+            for p in pb.iter_peaks_newest_first():
+                pivot_time = getattr(p, "close_time", None) or getattr(p, "time", None)
+                pivot_open_time = getattr(p, "open_time", None)
+                price = getattr(p, "level", None)
+                if price is None:
+                    price = getattr(p, "price", None)  # fallback if your object uses 'price'
+                hit = bool(getattr(p, "hit", getattr(p, "is_hit", False)))
+
+                rows.append((
+                    event_time,            # event_time
+                    symbol,                # symbol
+                    "HIGH",                # pivot_type
+                    pivot_time,            # pivot_time (close_time of that candle)
+                    pivot_open_time,       # pivot_open_time (if available)
+                    price,                 # price (close price of that pivot candle)
+                    hit,                   # hit
+                ))
+        except Exception:
+            # If iterator not available or error, skip silently
+            pass
+
+        # Iterate lows
+        try:
+            for p in pb.iter_lows_newest_first():
+                pivot_time = getattr(p, "close_time", None) or getattr(p, "time", None)
+                pivot_open_time = getattr(p, "open_time", None)
+                price = getattr(p, "level", None)
+                if price is None:
+                    price = getattr(p, "price", None)
+                hit = bool(getattr(p, "hit", getattr(p, "is_hit", False)))
+
+                rows.append((
+                    event_time,
+                    symbol,
+                    "LOW",
+                    pivot_time,
+                    pivot_open_time,
+                    price,
+                    hit,
+                ))
+        except Exception:
+            pass
+
+    return rows
+
+
+def _async_insert_pivot_list(rows: List[tuple]) -> None:
+    """
+    Insert rows into pivot_list in a background thread to avoid blocking.
+    Schema: (event_time, symbol, pivot_type, pivot_time, pivot_open_time, price, hit)
+    """
+    if not rows:
+        return
+
+    def _worker(batch: List[tuple]) -> None:
+        try:
+            conn = get_pg_conn()
+            sql = """
+                INSERT INTO pivot_list (
+                    event_time, symbol, pivot_type, pivot_time, pivot_open_time, price, hit
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s)
+            """
+            with conn.cursor() as cur:
+                cur.executemany(sql, batch)
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            # Soft-fail: keep processing without raising
+            print(f"[pivot_list insert] error: {e}")
+
+    t = threading.Thread(target=_worker, args=(rows,), daemon=True)
+    t.start()
+
+
+# ---------- Public API ----------
+
 def init_entry(candle_buffer):
     """
     Pass your global CandleBuffer instance here, e.g. buffers.CANDLE_BUFFER
     """
     global _candle_buffer
     _candle_buffer = candle_buffer
+
 
 def on_candle_closed(exchange: str, symbol: str, timeframe: str, close_time: Any):
     """
@@ -60,9 +165,11 @@ def on_candle_closed(exchange: str, symbol: str, timeframe: str, close_time: Any
     if not ready:
         return
 
+    event_time = minute_trunc(close_time)
+
     # --- Compute/update pivots into the SAME registry singleton ---
     execute_strategy(
-        close_time=close_time,
+        close_time=event_time,
         candle_registry=_candle_buffer,   # <- pass CandleBuffer here
         pivot_registry=_pivot_registry,   # <- SAME instance as the decision engine uses
         timeframe=TIMEFRAME,
@@ -73,6 +180,13 @@ def on_candle_closed(exchange: str, symbol: str, timeframe: str, close_time: Any
         hit_strict=True
     )
 
+    # --- Immediately snapshot all pivots and insert into pivot_list (async) ---
+    try:
+        rows = _gather_pivot_list_rows(event_time=event_time, timeframe=TIMEFRAME)
+        _async_insert_pivot_list(rows)
+    except Exception as e:
+        print(f"[pivot_list snapshot] error: {e}")
+
     # --- Decision engine call with grouping + DB connection ---
     sigmem = SignalMemory()
     conn = get_pg_conn()
@@ -81,11 +195,12 @@ def on_candle_closed(exchange: str, symbol: str, timeframe: str, close_time: Any
         exchange=exchange,
         symbols=[s for (_, s) in EXPECTED_SYMBOLS],  # flat list of symbol names
         timeframe=TIMEFRAME,
-        event_time=minute_trunc(close_time),
+        event_time=event_time,
         signal_memory=sigmem,
         groups=SYMBOL_GROUPS,
-        conn=conn,   # <-- give DB connection so rows get inserted
+        conn=conn,   # used for pivot_loop_log inserts inside the engine
     )
+
 
 def get_pivot_registry() -> PivotBufferRegistry:
     return _pivot_registry

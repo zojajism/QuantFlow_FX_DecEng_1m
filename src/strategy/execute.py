@@ -131,8 +131,8 @@ def execute_strategy(
             f"latest_peak={_fmt_pivot(lp)} latest_low={_fmt_pivot(ll)}",
             flush=True
         )
-    '''
 
+    
     # 3) Dump full lists for a target symbol (newest -> oldest by CLOSE time)
     target_exch = "OANDA"
     target_sym  = "EUR/USD"   # change here if you want another
@@ -160,7 +160,8 @@ def execute_strategy(
     else:
         for p in lows_list:
             print("  ", _fmt_pivot(p), flush=True)
-
+   
+    '''
 
 def _fmt_time_min(t) -> str:
     """Format to 'YYYY-MM-DD HH:MM' for datetime/int/str."""
