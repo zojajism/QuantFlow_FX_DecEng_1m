@@ -3,11 +3,12 @@
 # Adds:
 #   - open_time in outputs
 #   - "hit" flag per pivot (peak: any later higher high? low: any later lower low?)
+#   - MIN_PIVOT_DISTANCE filter: enforce minimum candle distance between pivots of same type
 #
 # API:
 #   detect_pivots(
 #       candles: list[dict],
-#       n: int = 3,
+#       n: int = 5,
 #       eps: float = 1e-9,
 #       *,
 #       high_key: str = "High",
@@ -20,7 +21,7 @@
 #
 # Returns:
 #   peaks: list of {"index": int, "time": any, "open_time": any, "high": float, "hit": bool}
-#   lows : list of {"index": int, "time": any, "open_time": any, "low":  float, "hit": bool}
+#   lows : list of {"index": int, "time": any, "open_time": any, "low":  float, "hit": bool]
 #
 # Notes:
 # - eps is only for plateau consolidation equality (price units).
@@ -29,10 +30,75 @@
 from typing import List, Dict, Tuple, Any
 import numpy as np
 
+# Maximum “plateau gap” in terms of candle index between pivot candidates
+# that we *might* want to treat as the same plateau. With the current
+# consolidation logic (consecutive True mask), this effectively means
+# we only merge *immediately adjacent* bars that are both pivots.
+PLATEAU_MAX_GAP = 1
+
+# Minimum candle distance between two pivots of the same type (peak/low).
+# If two candidate pivots are closer than this, we will keep only one of them:
+#   - for peaks: keep the one with the *higher* high
+#   - for lows : keep the one with the *lower* low
+MIN_PIVOT_DISTANCE = 5
+
+
+def _enforce_min_pivot_distance(
+    indices: np.ndarray,
+    values: np.ndarray,
+    *,
+    is_peak: bool,
+    min_dist: int,
+    eps: float,
+) -> List[int]:
+    """
+    Enforce a minimum candle distance between pivots of the same type.
+
+    Strategy:
+      - Walk through candidate pivot indices in ascending order.
+      - If the new candidate is within `min_dist` candles of the last kept pivot:
+          * decide which one to keep:
+              - peaks : keep the one with larger `values[idx]`
+              - lows  : keep the one with smaller `values[idx]`
+          * update the last kept pivot (replace) or drop the new one.
+      - Otherwise, accept the new candidate as a separate pivot.
+    """
+    if min_dist is None or min_dist <= 1 or len(indices) == 0:
+        # Nothing to do
+        return [int(i) for i in indices]
+
+    kept: List[int] = []
+    for idx in indices:
+        idx = int(idx)
+        if not kept:
+            kept.append(idx)
+            continue
+
+        last_idx = kept[-1]
+        if idx - last_idx < min_dist:
+            # Too close -> choose better pivot between idx and last_idx
+            v_new = float(values[idx])
+            v_old = float(values[last_idx])
+
+            if is_peak:
+                # prefer higher high for peaks
+                if v_new > v_old + eps:
+                    kept[-1] = idx
+                # else keep old one (do nothing)
+            else:
+                # prefer lower low for lows
+                if v_new < v_old - eps:
+                    kept[-1] = idx
+                # else keep old one (do nothing)
+        else:
+            kept.append(idx)
+
+    return kept
+
 
 def detect_pivots(
     candles: List[Dict[str, Any]],
-    n: int = 3,
+    n: int = 5,
     eps: float = 1e-9,
     *,
     high_key: str = "High",
@@ -94,7 +160,8 @@ def detect_pivots(
             # grow run while subsequent True and near-equal value
             while j + 1 < m and mask[j + 1] and abs(vals[j + 1] - vals[i]) <= eps:
                 j += 1
-            keep = (i + j) // 2  # ALWAYS center bar
+            # ALWAYS keep center bar of the plateau
+            keep = (i + j) // 2
             out[keep] = True
             i = j + 1
         return out
@@ -122,10 +189,25 @@ def detect_pivots(
         peak_hit_fn = lambda idx: bool(suf_max[idx] >= H[idx])
         low_hit_fn  = lambda idx: bool(suf_min[idx] <= L[idx])
 
-    # ---- Build compact outputs (with index + times + price + hit) ----
-    peak_idx = np.flatnonzero(is_peak)
-    low_idx  = np.flatnonzero(is_low)
+    # ---- Build indices and enforce MIN_PIVOT_DISTANCE ----
+    peak_idx_raw = np.flatnonzero(is_peak)
+    low_idx_raw  = np.flatnonzero(is_low)
 
+    # Apply minimum distance filtering separately for peaks and lows
+    peak_idx = _enforce_min_pivot_distance(
+        peak_idx_raw, H,
+        is_peak=True,
+        min_dist=MIN_PIVOT_DISTANCE,
+        eps=eps,
+    )
+    low_idx = _enforce_min_pivot_distance(
+        low_idx_raw, L,
+        is_peak=False,
+        min_dist=MIN_PIVOT_DISTANCE,
+        eps=eps,
+    )
+
+    # ---- Build compact outputs (with index + times + price + hit) ----
     peaks = [{
         "index": int(i),
         "time": T_close[i],

@@ -3,6 +3,7 @@ from typing import List, Tuple, Any, Dict
 from .pivot_buffer import Pivot
 from .pivots_simple import detect_pivots
 
+
 def compute_pivots(
     candles: List[Dict[str, Any]],
     *,
@@ -30,8 +31,24 @@ def compute_pivots(
         hit_strict=hit_strict,
     )
 
-    peaks = [Pivot(time=p["time"], open_time=p.get("open_time"), price=p["high"], is_hit=bool(p.get("hit", False)))
-             for p in peaks_raw]
-    lows  = [Pivot(time=q["time"], open_time=q.get("open_time"), price=q["low"],  is_hit=bool(q.get("hit", False)))
-             for q in lows_raw]
+    peaks = [
+        Pivot(
+            time=p["time"],
+            open_time=p.get("open_time"),
+            price=p["high"],
+            is_hit=bool(p.get("hit", False)),
+        )
+        for p in peaks_raw
+    ]
+
+    lows = [
+        Pivot(
+            time=q["time"],
+            open_time=q.get("open_time"),
+            price=q["low"],
+            is_hit=bool(q.get("hit", False)),
+        )
+        for q in lows_raw
+    ]
+
     return peaks, lows
