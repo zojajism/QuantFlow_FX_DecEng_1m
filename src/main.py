@@ -16,6 +16,11 @@ from dotenv import load_dotenv
 import yaml
 from pathlib import Path
 from entry import on_candle_closed, init_entry
+from buffers.tick_registry_provider import get_tick_registry
+
+from signals.open_signal_registry import get_open_signal_registry
+
+from database.db_general import get_pg_conn
 
 Candle_SUBJECT = "candles.>"   
 Candle_STREAM = "STREAM_CANDLES"   
@@ -34,6 +39,7 @@ if not CONFIG_PATH.exists():
 async def main():
 
     await start_telegram_notifier()   
+    
 
     try:
 
@@ -44,6 +50,7 @@ async def main():
             env_path = Path(__file__).resolve().parent / "data" / ".env"
         load_dotenv(dotenv_path=env_path)
 
+        DB_Conn = get_pg_conn()
 
 
         logger = setup_logger()
@@ -81,8 +88,25 @@ async def main():
                             "Message": f"Candle buffer initialized."
                         })
                 )
+        
+        # --- Consumer 1: Tick Engine (receives NEW messages)
+        try:
+            await js.delete_consumer(Tick_STREAM, Tick_DURABLE_NAME)
+        except Exception:
+            pass
+        
+        await js.add_consumer(
+            Tick_STREAM,
+            api.ConsumerConfig(
+                durable_name=Tick_DURABLE_NAME,
+                filter_subject=Tick_SUBJECT,
+                ack_policy=api.AckPolicy.EXPLICIT,
+                deliver_policy=api.DeliverPolicy.NEW,  
+                max_ack_pending=5000,
+            )
+        )
 
-        # --- Consumer: Candle Engine
+        # --- Consumer ۲: Candle Engine
         try:
             await js.delete_consumer(Candle_STREAM, Candle_DURABLE_NAME)
         except Exception:
@@ -98,9 +122,66 @@ async def main():
                 max_ack_pending=5000,
             )
         )
-
+       
+        # Pull-based subscription for Tick Engine
+        sub_Tick = await js.pull_subscribe(Tick_SUBJECT, durable=Tick_DURABLE_NAME)
+    
         # Pull-based subscription for Candle Engine
         sub_Candle = await js.pull_subscribe(Candle_SUBJECT, durable=Candle_DURABLE_NAME)
+
+
+        async def tick_engine_worker():
+            while True:
+                try:
+                    msgs = await sub_Tick.fetch(100, timeout=1)
+                    for msg in msgs:
+                        #logger.info(f"Received from {msg.subject}")
+                        
+                        tick_data = json.loads(msg.data.decode("utf-8"))
+                        symbol = tick_data["symbol"]
+                        exchange = tick_data["exchange"]
+                        if (exchange == "OANDA" and symbol in symbols):
+
+                            raw_tick_time = tick_data.get("tick_time")
+                            if raw_tick_time:
+                                try:
+                                    if raw_tick_time.endswith("Z"):
+                                        parsed_time = datetime.fromisoformat(raw_tick_time.replace("Z", "+00:00"))
+                                    else:
+                                        parsed_time = datetime.fromisoformat(raw_tick_time)
+                                except Exception:
+                                    parsed_time = datetime.utcnow()
+                            else:
+                                parsed_time = datetime.utcnow()
+                                
+                            bid = float(tick_data["bid"])
+                            ask = float(tick_data["ask"])
+                            #logger.info(f"Tick for {symbol}, tick_time:{parsed_time}")   
+                            tick_registry = get_tick_registry()
+                            tick_registry.update_tick(exchange, symbol, bid, ask, parsed_time)
+
+                            open_sig_registry = get_open_signal_registry()
+                            open_sig_registry.process_tick_for_symbol(
+                                exchange=exchange,
+                                symbol=symbol,
+                                bid=bid,
+                                ask=ask,
+                                now=parsed_time,
+                                conn=DB_Conn,   # or None if you handle DB elsewhere
+                            )
+
+
+                        await msg.ack()
+                except Exception as e:
+                    logger.error(
+                            json.dumps({
+                                    "EventCode": -1,
+                                    "Message": f"NATS error: Tick, {e}"
+                                })
+                        )
+                    #notify_telegram(f"⛔️ NATS-Error-Tick-Engine \n" + str(e), ChatType.ALERT)                    
+                    await asyncio.sleep(0.05)
+
 
         async def candle_engine_worker():
             while True:
@@ -125,7 +206,6 @@ async def main():
                             key = Keys(exchange, symbol, timeframe)
                             buffers.CANDLE_BUFFER.append(key, candle_data)
 
-                            #print(f"symbol: {symbol}, O: {candle_data["open_time"]}, C: {candle_data["close_time"]}")
                             on_candle_closed(exchange, symbol, "1m", candle_data["close_time"])
                         #========== Main section, getting the candles we need ====================================
                         
@@ -141,7 +221,7 @@ async def main():
                         })
                 )
     
-        await asyncio.gather(candle_engine_worker())
+        await asyncio.gather(tick_engine_worker(), candle_engine_worker())
 
     finally:
         notify_telegram(f"⛔️ QuantFlow_Fx_DecEng_1m App stopped.", ChatType.ALERT)

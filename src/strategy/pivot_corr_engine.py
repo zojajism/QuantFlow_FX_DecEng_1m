@@ -19,7 +19,16 @@ from pivots.pivot_registry_provider import get_pivot_registry
 # Cross-trigger signal dedup
 from signals.signal_registry import get_signal_registry
 
-from telegram_notifier import notify_telegram, ChatType, start_telegram_notifier, close_telegram_notifier, ChatType
+from telegram_notifier import notify_telegram, ChatType
+
+from buffers.tick_registry_provider import get_tick_registry
+
+from signals.open_signal_registry import get_open_signal_registry, OpenSignal
+
+MAX_TICK_AGE_SEC = 10  # if last tick older than this (in seconds), fallback to candle close
+# NOTE: We DO NOT apply any min-pips filter here.
+# All signals are emitted and logged. Final filters will live in Order Management layer.
+
 
 # --------------------------------------------------------------------
 # Core State Classes
@@ -67,62 +76,17 @@ def run_decision_event(
     """
     Main correlation engine for pivot-based signals.
 
-    Strategy (current version):
+    IMPORTANT (current design):
 
-      • We have a set of symbols, partitioned into two groups (SAME and OPP).
-        Example:
-          SAME: [EUR/USD, GBP/USD, AUD/USD]
-          OPP : [USD/CHF, DXY/DXY]
+      • This layer is responsible for:
+          - reading pivots
+          - computing correlation hits
+          - deciding which symbols become "signal targets"
+          - logging ALL such signals (no pip-size filters here)
+          - deduping so we don't spam duplicates
 
-      • For each ref_symbol in `symbols` and ref_type in {"HIGH", "LOW"}:
-          1) Read ref pivots of that type (peaks for HIGH, lows for LOW).
-          2) For each ref pivot (ref_symbol, ref_type, ref_time, ref_price, ref_hit):
-             - Find matching pivots in SAME group with SAME type, within ±window minutes.
-             - Find matching pivots in OPP group with OPPOSITE type, within ±window minutes.
-             - For each symbol in the universe, define "hit" as:
-                 * ref_symbol: ref_hit
-                 * peers: found=True and hit=True (their pivot already hit)
-             - total_hits = number of symbols that are "hit" (True).
-
-      • Decision rule:
-          If total_hits >= 3 (across all 5), then this configuration is valid.
-          On this configuration we will EMIT SIGNALS on those symbols that:
-
-            - are NOT "DXY/DXY" (DXY can only confirm, never be a target),
-            - have a matched pivot (found=True),
-            - are NOT hit yet (hit=False) in this configuration.
-
-          In other words: "3 or more hits -> trade on the remaining found-but-not-hit symbols".
-
-      • Direction (BUY/SELL) – NEW LOGIC:
-          - Direction is now based on the TARGET symbol's pivot type:
-              target pivot HIGH → BUY
-              target pivot LOW  → SELL
-
-        SAME/OPP groups are not used for direction any more, only for correlation.
-
-      • Entry price (position_price):
-          - We take the latest (most recent) candle close
-            from CandleBuffer for that (exchange, symbol, timeframe).
-          - This is Option 1: simple and consistent with a 1m strategy.
-          - In the future, we can switch to using Tick price as entry.
-
-      • Target:
-          - We use the pivot price of the target symbol as "pivot_price":
-               - For ref symbol: ref_price
-               - For peers: peer pivot price
-          - target_pips = (pivot_price - position_price) / pip_size(symbol)
-          - target_price = position_price + target_pips * pip_size(symbol)
-
-      • Dedup:
-          - Within one run_decision_event:
-              local key = (symbol, side, found_at_minute)
-          - Across multiple events:
-              use signal_registry.remember(symbol, side, found_at_minute)
-
-      • Logging:
-          - We always write rows into pivot_loop_log for SAME & OPP peers.
-          - We write signals into signals table when they are generated.
+      • We DO NOT apply risk/size/7-pip/etc filters here.
+        Those belong to the later Order Management / Execution layer.
     """
     pivot_reg = get_pivot_registry()
     sig_registry = get_signal_registry()
@@ -160,6 +124,8 @@ def run_decision_event(
     # key: (symbol, side, found_at_minute)
     emitted_local: set[Tuple[str, str, datetime]] = set()
 
+    tick_registry = get_tick_registry()
+
     # ----------------------------------------------------------------
     # Main loop over each ref symbol and HIGH/LOW type
     # ----------------------------------------------------------------
@@ -183,8 +149,8 @@ def run_decision_event(
             # Newest -> oldest within max_lookback
             for _, rp in enumerate(ref_pivots, start=1):
                 pivot_time = rp["time"]           # datetime of pivot (close time)
-                ref_price = rp["price"]          # float pivot price
-                ref_hit   = bool(rp["hit"])      # pivot already hit or not
+                ref_price = rp["price"]           # float pivot price
+                ref_hit   = bool(rp["hit"])       # pivot already hit or not
 
                 # SAME-type peers (peaks or lows depending on ref_type)
                 rows_same, _ = _compare_ref_with_peers(
@@ -314,25 +280,28 @@ def run_decision_event(
                         continue
 
                     # ------------------------------------------------
-                    # 4) Entry price: latest close from CandleBuffer
+                    # 4) Determine side (BUY/SELL) based on TARGET pivot type
                     # ------------------------------------------------
-                    position_price = _get_latest_close_price(exchange, tgt, timeframe)
-                    if position_price is None:
-                        # This should be rare if CandleBuffer is loaded
-                        # We skip this target, but other targets may still work
-                        print(
-                            f"[SKIP] target={tgt} | reason=no latest candle in CANDLE_BUFFER "
-                            f"(exchange={exchange}, tf={timeframe})"
-                        )
-                        continue
+                    side = "buy" if tgt_pivot_type == "HIGH" else "sell"
 
                     # ------------------------------------------------
-                    # 5) Determine side (BUY/SELL) based on TARGET pivot type
+                    # 5) Entry price: try Tick first, then candle-close fallback
                     # ------------------------------------------------
-                    # Rule:
-                    #   - target pivot HIGH -> BUY
-                    #   - target pivot LOW  -> SELL
-                    side = "buy" if tgt_pivot_type == "HIGH" else "sell"
+                    position_price, price_source = _get_entry_price_with_tick_fallback(
+                        tick_registry=tick_registry,
+                        exchange=exchange,
+                        symbol=tgt,
+                        timeframe=timeframe,
+                        side=side,
+                        event_time=event_time,
+                    )
+                    if position_price is None:
+                        # This should be rare if buffers and ticks are working
+                        print(
+                            f"[SKIP] target={tgt} | reason=no price available "
+                            f"(exchange={exchange}, tf={timeframe}, side={side}, source={price_source})"
+                        )
+                        continue
 
                     # Normalize pivot time to minute for dedup keys
                     found_at_minute = tgt_pivot_time.replace(second=0, microsecond=0)
@@ -349,7 +318,7 @@ def run_decision_event(
                         # This signal was already emitted in a previous event
                         continue
 
-                    # 3) Compute targets
+                    # 3) Compute targets (NO min-pip filter here)
                     target_pips = _pips(tgt, tgt_pivot_price, position_price)
                     target_price = _price_from_pips(tgt, position_price, target_pips)
 
@@ -366,21 +335,48 @@ def run_decision_event(
                         f"confirm_symbols=[{confirm_syms_str}] | "
                         f"ref={ref_symbol} {ref_type} @ {pivot_time} | "
                         f"pivot_time(target)={tgt_pivot_time} | "
-                        f"pivot_type(target)={tgt_pivot_type}"
+                        f"pivot_type(target)={tgt_pivot_type} | "
+                        f"price_source={price_source}"
                     )
-                    
-                    notify_telegram("⚡ Pivot Correlation Signal\n"
-                                    f"Symbol:      {tgt}\n"
-                                    f"Side:          {side.upper()}\n\n"
-                                    f"Entry price:   {position_price}\n"
-                                    f"Target price:  {target_price}\n"
-                                    f"Distance:      {target_pips}  pips\n"
-                                    f"Profit:        ${target_pips / 10000 * 5000}\n\n"
-                                    f"Ref pivot:     {ref_symbol}   {ref_type}\n"
-                                    f"Ref pivot time:        {pivot_time.strftime("%Y-%m-%d %H:%M")}\n\n"
-                                    f"Target pivot time:   {tgt_pivot_time.strftime("%Y-%m-%d %H:%M")}\n"
-                                    f"Event time:               {event_time.strftime("%Y-%m-%d %H:%M")}\n\n"
-                                    f"Confirm symbols:   {confirm_syms_str}", ChatType.INFO)
+
+                    # Telegram notification (multi-line, nicely formatted)
+                    try:
+                        profit_est = (target_pips / Decimal("10000")) * Decimal("5000")
+                        msg = (
+                            "⚡ Pivot Correlation Signal\n"
+                            f"Symbol:         {tgt}\n"
+                            f"Side:           {side.upper()}\n"
+                            f"Price source:   {price_source}\n\n"
+                            f"Entry price:    {position_price}\n"
+                            f"Target price:   {target_price}\n"
+                            f"Distance:       {target_pips} pips\n"
+                            f"Est. Profit:    ${profit_est}\n\n"
+                            f"Ref pivot:      {ref_symbol}  ({ref_type})\n"
+                            f"Ref pivot time: {pivot_time.strftime('%Y-%m-%d %H:%M')}\n\n"
+                            f"Target pivot time: {tgt_pivot_time.strftime('%Y-%m-%d %H:%M')}\n"
+                            f"Event time:        {event_time.strftime('%Y-%m-%d %H:%M')}\n\n"
+                            f"Confirm symbols: {confirm_syms_str}"
+                        )
+                        notify_telegram(msg, ChatType.INFO)
+                    except Exception as e:
+                        print(f"[WARN] telegram notify failed: {e}")
+
+
+                    open_sig_registry = get_open_signal_registry()
+
+                    open_sig_registry.add_signal(
+                        OpenSignal(
+                            exchange=exchange,
+                            symbol=tgt,
+                            timeframe=timeframe,
+                            side=side,
+                            event_time=event_time,
+                            target_price=target_price,
+                            position_price=position_price,
+                            created_at=event_time,  # or datetime.utcnow()
+                        )
+                    )
+
 
                     # 5) Queue row for signals table INSERT (if conn is available)
                     if conn is not None:
@@ -396,6 +392,7 @@ def run_decision_event(
                             ref_type,               # ref_type (context)
                             pivot_time,             # pivot_time (ref anchor)
                             found_at_minute,        # found_at (target pivot time)
+                            price_source,           # NEW: "tick" / "candle_close" / "none"
                         ))
 
     # ----------------------------------------------------------------
@@ -405,7 +402,6 @@ def run_decision_event(
         if batch_rows_looplog:
             _insert_pivot_loop_log(conn, batch_rows_looplog)
         if batch_rows_signals:
-            print(batch_rows_signals)
             _insert_signals(conn, batch_rows_signals)
 
 
@@ -427,14 +423,6 @@ def _compare_ref_with_peers(
     For a given ref pivot (ref_symbol, ref_type, ref_time),
     scan each peer symbol and attempt to find a pivot of peer_type
     whose time is within +/- `window` minutes of ref_time.
-
-    Returns
-    -------
-    comparisons : List[Dict[str, Any]]
-        One dict per peer, with keys:
-          symbol, type, found, time, hit, delta_min, price
-    stats : Dict[str, int]
-        Simple stats, currently: {"hit": <count_of_hit_peers>}
     """
     comparisons: List[Dict[str, Any]] = []
     hit_counter = 0
@@ -513,10 +501,6 @@ def _find_pivot_in_window(
 def _insert_pivot_loop_log(conn: psycopg.Connection, rows: List[tuple]) -> None:
     """
     Insert many rows into pivot_loop_log in one batch.
-
-    Columns:
-      (event_time, ref_symbol, ref_type, peer_type, pivot_time, ref_is_hit,
-       symbol_compare, is_found, is_hit, delta_minute, found_at)
     """
     sql = """
         INSERT INTO pivot_loop_log (
@@ -541,11 +525,6 @@ def _insert_pivot_loop_log(conn: psycopg.Connection, rows: List[tuple]) -> None:
 def _insert_signals(conn: psycopg.Connection, rows: List[tuple]) -> None:
     """
     Insert generated signals in one batch.
-
-    Columns:
-      (event_time, signal_symbol, confirm_symbols, position_type,
-       position_price, target_pips, target_price,
-       ref_symbol, ref_type, pivot_time, found_at)
     """
     sql = """
         INSERT INTO signals (
@@ -559,8 +538,9 @@ def _insert_signals(conn: psycopg.Connection, rows: List[tuple]) -> None:
             ref_symbol,
             ref_type,
             pivot_time,
-            found_at
-        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            found_at,
+            price_source
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """
     with conn.cursor() as cur:
         cur.executemany(sql, rows)
@@ -577,12 +557,6 @@ def _collect_pivots_from_registry(
     """
     Read pivots for (exchange, symbol, timeframe) from PivotBufferRegistry,
     map them to simple dicts, and return newest-first.
-
-    The actual Pivot class is defined elsewhere and has:
-      - time       (close time)
-      - open_time  (open time)
-      - price      (peak or low price)
-      - is_hit     (whether this pivot has been hit by price)
     """
     reg = get_pivot_registry()
     pb = reg.get(exchange, symbol, timeframe)
@@ -597,7 +571,6 @@ def _collect_pivots_from_registry(
         it = pb.iter_lows_newest_first()
 
     for p in it:
-        # We rely on Pivot attributes defined in your project
         time_t = getattr(p, "time", None)
         open_time_t = getattr(p, "open_time", None)
         price_v = getattr(p, "price", None)
@@ -608,7 +581,7 @@ def _collect_pivots_from_registry(
             "open_time": open_time_t,
             "price": price_v,
             "hit": bool(hit_v),
-            "type": pivot_type.upper(),  # keep explicit type on dict
+            "type": pivot_type.upper(),
         })
 
         if len(out) >= max_lookback:
@@ -618,8 +591,59 @@ def _collect_pivots_from_registry(
 
 
 # --------------------------------------------------------------------
-# Candle & Price/Pip helpers
+# Candle, Tick & Price/Pip helpers
 # --------------------------------------------------------------------
+
+def _get_entry_price_with_tick_fallback(
+    *,
+    tick_registry,
+    exchange: str,
+    symbol: str,
+    timeframe: str,
+    side: str,
+    event_time: datetime,
+) -> Tuple[Optional[Decimal], str]:
+    """
+    Determine entry price for a signal:
+
+      1) Try to use the latest Tick from TickRegistry:
+           - If a tick exists and abs(age_sec) <= MAX_TICK_AGE_SEC:
+               BUY  -> ASK
+               SELL -> BID
+      2) Otherwise, fallback to the latest candle close from CandleBuffer.
+
+    Returns:
+      (price, source) where source in {"tick", "candle_close", "none"}.
+    """
+    price_source = "none"
+    try:
+        tick = tick_registry.get_last_tick(exchange, symbol)
+    except Exception:
+        tick = None
+
+    if tick is not None and isinstance(event_time, datetime):
+        try:
+            age_sec = abs((tick.time - event_time).total_seconds())
+        except Exception:
+            age_sec = None
+
+        if age_sec is not None and age_sec <= MAX_TICK_AGE_SEC:
+            side_upper = side.upper()
+            if side_upper == "BUY":
+                px = Decimal(str(tick.ask))
+            else:  # SELL
+                px = Decimal(str(tick.bid))
+            price_source = "tick"
+            return px, price_source
+
+    # Fallback to latest candle close
+    close_px = _get_latest_close_price(exchange, symbol, timeframe)
+    if close_px is not None:
+        price_source = "candle_close"
+        return close_px, price_source
+
+    return None, price_source
+
 
 def _get_latest_close_price(
     exchange: str,
@@ -629,13 +653,6 @@ def _get_latest_close_price(
     """
     Get the latest (most recent) close price for a symbol/timeframe
     from CandleBuffer.
-
-    We do NOT search by time; we simply take the last candle
-    currently stored in the buffer.
-
-    This matches "Option 1" discussed:
-      - For now, entry price = last candle close.
-      - Later, we can change to Tick price or exact time-based lookup.
     """
     try:
         cb = getattr(buffers, "CANDLE_BUFFER", None)
@@ -649,12 +666,10 @@ def _get_latest_close_price(
 
         c = candles[0]
 
-        # Try common close field names (based on your DB and collector schema)
         for attr in ("Close", "close", "c", "ClosePrice", "C"):
             if isinstance(c, dict) and attr in c:
                 return Decimal(str(c[attr]))
 
-        # If you store close under a different key, add it here
         return None
     except Exception:
         return None
@@ -663,10 +678,6 @@ def _get_latest_close_price(
 def _pip_size(symbol: str) -> Decimal:
     """
     Return pip size (in price units) for the given symbol.
-
-    Simplified rule:
-      - If symbol contains "JPY" or "DXY" => pip = 0.01
-      - Otherwise => pip = 0.0001
     """
     s = symbol.upper()
     if "JPY" in s or "DXY" in s:
@@ -674,15 +685,12 @@ def _pip_size(symbol: str) -> Decimal:
     return Decimal("0.0001")
 
 
-def _pips(symbol: str, pivot_price: Decimal, close_price: Decimal) -> Decimal:
+def _pips(symbol: str, pivot_price: Decimal, price: Decimal) -> Decimal:
     """
-    (pivot_price - close_price) expressed in pips (signed).
-
-    Positive => pivot above price,
-    Negative => pivot below price.
+    (pivot_price - price) expressed in pips (signed).
     """
     size = _pip_size(symbol)
-    return (pivot_price - close_price) / size
+    return (pivot_price - price) / size
 
 
 def _price_from_pips(symbol: str, price: Decimal, pips: Decimal) -> Decimal:
@@ -700,11 +708,7 @@ def _price_from_pips(symbol: str, price: Decimal, pips: Decimal) -> Decimal:
 
 def _signed_minutes(t1: Optional[datetime], t2: Optional[datetime]) -> int:
     """
-    Signed difference in minutes:
-
-      > 0  if t1 is after t2
-      < 0  if t1 is before t2
-      = 0  if same minute
+    Signed difference in minutes.
     """
     if t1 is None or t2 is None:
         return 0
@@ -717,17 +721,6 @@ def _resolve_two_groups(
 ) -> Tuple[List[str], List[str]]:
     """
     Resolve two symbol groups from `groups` dict.
-
-    Example:
-      {
-          "GROUP_A": ["EUR/USD", "GBP/USD", "AUD/USD"],
-          "GROUP_B": ["USD/CHF", "DXY/DXY"]
-      }
-
-    We only care about the lists, not keys.
-
-    Returns:
-      same_group, opposite_group
     """
     if not groups:
         return list(symbols), []
@@ -752,12 +745,7 @@ def _decide_side(
     opposite_group: List[str],
 ) -> str:
     """
-    OLD DIRECTION LOGIC (kept for reference, currently unused):
-
-      - Based on ref_type + group membership.
-
-    We no longer call this function; direction is now based solely
-    on the target symbol's pivot type (HIGH -> BUY, LOW -> SELL).
+    OLD DIRECTION LOGIC (kept for reference, currently unused).
     """
     symbol_upper = symbol.upper()
 
