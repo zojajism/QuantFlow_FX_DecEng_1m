@@ -173,12 +173,12 @@ async def main():
 
                         await msg.ack()
                 except Exception as e:
-                    logger.error(
-                            json.dumps({
-                                    "EventCode": -1,
-                                    "Message": f"NATS error: Tick, {e}"
-                                })
-                        )
+                    #logger.error(
+                    #        json.dumps({
+                    #                "EventCode": -1,
+                    #                "Message": f"NATS error: Tick, {e}"
+                    #            })
+                    #    )
                     #notify_telegram(f"⛔️ NATS-Error-Tick-Engine \n" + str(e), ChatType.ALERT)                    
                     await asyncio.sleep(0.05)
 

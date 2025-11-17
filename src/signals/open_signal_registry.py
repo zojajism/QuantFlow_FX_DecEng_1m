@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from threading import Lock
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import psycopg
 
@@ -34,6 +34,7 @@ class OpenSignalRegistry:
       - updates the DB row for that signal
       - removes the signal from memory
     """
+
     def __init__(self) -> None:
         self._signals_by_symbol: Dict[str, List[OpenSignal]] = {}
         self._lock = Lock()
@@ -58,7 +59,6 @@ class OpenSignalRegistry:
         now: datetime,
         conn: Optional[psycopg.Connection] = None,
     ) -> None:
-       
         """
         Called on each tick for a given symbol.
 
@@ -126,11 +126,15 @@ class OpenSignalRegistry:
         conn: Optional[psycopg.Connection],
     ) -> None:
         """Handle a signal that has reached its target."""
-        
+
         # 1) Telegram notification
         try:
             # Calculate actual realized pips at hit
-            pip_size = Decimal("0.01") if ("JPY" in sig.symbol or "DXY" in sig.symbol) else Decimal("0.0001")
+            pip_size = (
+                Decimal("0.01")
+                if ("JPY" in sig.symbol or "DXY" in sig.symbol)
+                else Decimal("0.0001")
+            )
             pips_realized = (hit_price - sig.position_price) / pip_size
 
             # For BUY, positive pips are profit; for SELL reverse sign
@@ -157,7 +161,6 @@ class OpenSignalRegistry:
 
         except Exception as e:
             print(f"[WARN] telegram notify (target hit) failed: {e}")
-
 
         # 2) DB update (if connection is provided)
         if conn is None:

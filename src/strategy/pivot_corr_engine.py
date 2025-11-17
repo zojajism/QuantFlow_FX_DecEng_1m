@@ -88,6 +88,8 @@ def run_decision_event(
       • We DO NOT apply risk/size/7-pip/etc filters here.
         Those belong to the later Order Management / Execution layer.
     """
+    print(f"[DEBUG] run_decision_event called at {event_time} (tf={timeframe})")
+
     pivot_reg = get_pivot_registry()
     sig_registry = get_signal_registry()
 
@@ -315,7 +317,10 @@ def run_decision_event(
 
                     # 2) Cross-trigger dedup (across events)
                     if not sig_registry.remember(tgt, side, found_at_minute):
-                        # This signal was already emitted in a previous event
+                        print(
+                            "[DEDUP] Skipping duplicate signal from registry: "
+                            f"symbol={tgt}, side={side}, found_at={found_at_minute}"
+                        )
                         continue
 
                     # 3) Compute targets (NO min-pip filter here)
@@ -586,6 +591,8 @@ def _collect_pivots_from_registry(
 
         if len(out) >= max_lookback:
             break
+
+    print(f"[DEBUG] pivots collected for {symbol} {pivot_type}: {len(out)} items")
 
     return out
 
