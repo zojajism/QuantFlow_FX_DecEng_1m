@@ -2,6 +2,7 @@
 # English-only comments
 
 from __future__ import annotations
+
 from datetime import datetime
 from decimal import Decimal
 import threading
@@ -25,9 +26,19 @@ from buffers.tick_registry_provider import get_tick_registry
 
 from signals.open_signal_registry import get_open_signal_registry, OpenSignal
 
+from orders.order_executor import send_market_order, OrderExecutionResult
+
 MAX_TICK_AGE_SEC = 10  # if last tick older than this (in seconds), fallback to candle close
-# NOTE: We DO NOT apply any min-pips filter here.
-# All signals are emitted and logged. Final filters will live in Order Management layer.
+
+# Minimum pips distance to send order to broker
+MIN_PIPS_FOR_ORDER = Decimal("2")
+
+# Simple default units for now; later this will be driven by risk model
+DEFAULT_ORDER_UNITS = 1000
+
+# NOTE: We DO NOT apply any min-pip filter to signal generation itself.
+# All signals are emitted and logged. Final "send or not send" filter
+# is applied before order sending (MIN_PIPS_FOR_ORDER).
 
 
 # --------------------------------------------------------------------
@@ -39,8 +50,9 @@ class SignalMemory:
     Keeps a memory of processed signals WITHIN ONE run_decision_event call.
 
     This is only a local memory for the current event.
-    For cross-event deduplication across multiple events, we use signal_registry.
+    For cross-event deduplication across multiple events, we use SignalRegistry.
     """
+
     def __init__(self) -> None:
         self._seen: set[str] = set()
         self._lock = threading.Lock()
@@ -66,7 +78,7 @@ def run_decision_event(
     exchange: str,
     symbols: List[str],
     timeframe: str,
-    event_time: datetime,                 # just-closed candle time (trigger)
+    event_time: datetime,                 # just-closed candle time (trigger, UTC naive)
     signal_memory: SignalMemory,
     groups: Optional[Dict[str, List[str]]] = None,  # SAME/OPP groups
     conn: Optional[psycopg.Connection] = None,      # DB connection
@@ -76,20 +88,17 @@ def run_decision_event(
     """
     Main correlation engine for pivot-based signals.
 
-    IMPORTANT (current design):
+    Responsibilities:
+      - reading pivots
+      - computing correlation hits
+      - deciding which symbols become "signal targets"
+      - logging ALL such signals (no pip-size filters here)
+      - deduping so we don't spam duplicates
+      - optionally sending orders to broker when |pips| >= MIN_PIPS_FOR_ORDER
 
-      • This layer is responsible for:
-          - reading pivots
-          - computing correlation hits
-          - deciding which symbols become "signal targets"
-          - logging ALL such signals (no pip-size filters here)
-          - deduping so we don't spam duplicates
-
-      • We DO NOT apply risk/size/7-pip/etc filters here.
-        Those belong to the later Order Management / Execution layer.
+    Risk & capital sizing logic will later live in a dedicated
+    Order Management layer. For now we use DEFAULT_ORDER_UNITS.
     """
-    print(f"[DEBUG] run_decision_event called at {event_time} (tf={timeframe})")
-
     pivot_reg = get_pivot_registry()
     sig_registry = get_signal_registry()
 
@@ -122,11 +131,15 @@ def run_decision_event(
     batch_rows_looplog: List[tuple] = []
     batch_rows_signals: List[tuple] = []
 
+    # New: order-related updates for existing signals rows
+    batch_order_updates: List[tuple] = []
+
     # LOCAL (per-event) dedup:
     # key: (symbol, side, found_at_minute)
     emitted_local: set[Tuple[str, str, datetime]] = set()
 
     tick_registry = get_tick_registry()
+    open_sig_registry = get_open_signal_registry()
 
     # ----------------------------------------------------------------
     # Main loop over each ref symbol and HIGH/LOW type
@@ -152,7 +165,7 @@ def run_decision_event(
             for _, rp in enumerate(ref_pivots, start=1):
                 pivot_time = rp["time"]           # datetime of pivot (close time)
                 ref_price = rp["price"]           # float pivot price
-                ref_hit   = bool(rp["hit"])       # pivot already hit or not
+                ref_hit = bool(rp["hit"])         # pivot already hit or not
 
                 # SAME-type peers (peaks or lows depending on ref_type)
                 rows_same, _ = _compare_ref_with_peers(
@@ -298,14 +311,13 @@ def run_decision_event(
                         event_time=event_time,
                     )
                     if position_price is None:
-                        # This should be rare if buffers and ticks are working
                         print(
                             f"[SKIP] target={tgt} | reason=no price available "
                             f"(exchange={exchange}, tf={timeframe}, side={side}, source={price_source})"
                         )
                         continue
 
-                    # Normalize pivot time to minute for dedup keys
+                    # Normalize pivot time to minute for dedup keys (and DB found_at)
                     found_at_minute = tgt_pivot_time.replace(second=0, microsecond=0)
 
                     local_key = (tgt.upper(), side, found_at_minute)
@@ -317,13 +329,14 @@ def run_decision_event(
 
                     # 2) Cross-trigger dedup (across events)
                     if not sig_registry.remember(tgt, side, found_at_minute):
+                        # This signal was already emitted in a previous event
                         print(
                             "[DEDUP] Skipping duplicate signal from registry: "
                             f"symbol={tgt}, side={side}, found_at={found_at_minute}"
                         )
                         continue
 
-                    # 3) Compute targets (NO min-pip filter here)
+                    # 3) Compute targets (NO min-pip filter here for signal creation)
                     target_pips = _pips(tgt, tgt_pivot_price, position_price)
                     target_price = _price_from_pips(tgt, position_price, target_pips)
 
@@ -331,7 +344,7 @@ def run_decision_event(
                         f"{tgt}|{side}|{found_at_minute.isoformat()}"
                     )
 
-                    # 4) Print human-readable signal info
+                    # Print human-readable signal info
                     print(
                         "[SIGNAL] "
                         f"event_time={event_time} | target={tgt} | side={side} | "
@@ -366,9 +379,35 @@ def run_decision_event(
                     except Exception as e:
                         print(f"[WARN] telegram notify failed: {e}")
 
+                    # ------------------------------------------------
+                    # 6) Decide whether to send order to broker
+                    # ------------------------------------------------
+                    send_to_broker = abs(target_pips) >= MIN_PIPS_FOR_ORDER
+                    order_info: Optional[OrderExecutionResult] = None
 
-                    open_sig_registry = get_open_signal_registry()
+                    if send_to_broker:
+                        try:
+                            instrument = _to_oanda_instrument(tgt)
+                            client_order_id = (
+                                f"qf-{event_time.strftime('%Y%m%d%H%M%S')}-"
+                                f"{instrument.replace('_', '')}"
+                            )
+                            order_units = DEFAULT_ORDER_UNITS
 
+                            order_info = send_market_order(
+                                symbol=instrument,
+                                side=side,
+                                units=order_units,
+                                tp_price=target_price,
+                                client_order_id=client_order_id,
+                            )
+                        except Exception as e:
+                            print(f"[ORDER] Failed to send order for {tgt}: {e}")
+                            order_info = None
+
+                    # ------------------------------------------------
+                    # 7) Register OpenSignal (with optional order info)
+                    # ------------------------------------------------
                     open_sig_registry.add_signal(
                         OpenSignal(
                             exchange=exchange,
@@ -378,18 +417,75 @@ def run_decision_event(
                             event_time=event_time,
                             target_price=target_price,
                             position_price=position_price,
-                            created_at=event_time,  # or datetime.utcnow()
+                            created_at=event_time,
+                            order_env=(order_info.env if order_info else None),
+                            broker_order_id=(
+                                order_info.broker_order_id if order_info else None
+                            ),
+                            broker_trade_id=(
+                                order_info.broker_trade_id if order_info else None
+                            ),
+                            order_units=(
+                                order_info.units if order_info else None
+                            ),
+                            actual_entry_time=(
+                                order_info.actual_entry_time if order_info else None
+                            ),
+                            actual_entry_price=(
+                                order_info.actual_entry_price if order_info else None
+                            ),
+                            actual_tp_price=(
+                                order_info.actual_tp_price if order_info else None
+                            ),
+                            order_status=(
+                                order_info.status if order_info else "none"
+                            ),
+                            exec_latency_ms=(
+                                order_info.exec_latency_ms if order_info else None
+                            ),
                         )
                     )
 
+                    # ------------------------------------------------
+                    # 8) Queue DB updates for order-related columns
+                    # ------------------------------------------------
+                    if order_info is not None:
+                        batch_order_updates.append((
+                            # SET columns
+                            order_info.env,               # order_env
+                            True,                         # order_sent
+                            order_info.order_sent_time,   # order_sent_time
+                            order_info.broker_order_id,   # broker_order_id
+                            order_info.broker_trade_id,   # broker_trade_id
+                            None,                         # allocation_block (later)
+                            order_info.units,             # order_units
+                            order_info.actual_entry_time, # actual_entry_time
+                            order_info.actual_entry_price,# actual_entry_price
+                            order_info.actual_tp_price,   # actual_tp_price
+                            None,                         # actual_exit_time
+                            None,                         # actual_exit_price
+                            order_info.status,            # order_status
+                            None,                         # slippage_pips
+                            None,                         # profit_pips
+                            None,                         # profit_ccy
+                            order_info.exec_latency_ms,   # exec_latency_ms
+                            # WHERE keys
+                            tgt,                          # signal_symbol
+                            side,                         # position_type
+                            event_time,                   # event_time
+                            found_at_minute,              # found_at
+                        ))
 
-                    # 5) Queue row for signals table INSERT (if conn is available)
+                    # ------------------------------------------------
+                    # 9) Queue row for signals table INSERT
+                    # ------------------------------------------------
                     if conn is not None:
                         batch_rows_signals.append((
                             event_time,             # event_time (trigger)
                             tgt,                    # signal_symbol
                             confirm_syms_str,       # confirm_symbols
                             side,                   # position_type
+                            price_source,           # price_source
                             position_price,         # position_price
                             target_pips,            # target_pips
                             target_price,           # target_price
@@ -397,17 +493,18 @@ def run_decision_event(
                             ref_type,               # ref_type (context)
                             pivot_time,             # pivot_time (ref anchor)
                             found_at_minute,        # found_at (target pivot time)
-                            price_source,           # NEW: "tick" / "candle_close" / "none"
                         ))
 
     # ----------------------------------------------------------------
-    # 4) Batch DB writes
+    # 10) Batch DB writes
     # ----------------------------------------------------------------
     if conn:
         if batch_rows_looplog:
             _insert_pivot_loop_log(conn, batch_rows_looplog)
         if batch_rows_signals:
             _insert_signals(conn, batch_rows_signals)
+        if batch_order_updates:
+            _update_signals_with_orders(conn, batch_order_updates)
 
 
 # --------------------------------------------------------------------
@@ -537,15 +634,54 @@ def _insert_signals(conn: psycopg.Connection, rows: List[tuple]) -> None:
             signal_symbol,
             confirm_symbols,
             position_type,
+            price_source,
             position_price,
             target_pips,
             target_price,
             ref_symbol,
             ref_type,
             pivot_time,
-            found_at,
-            price_source
+            found_at
         ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    """
+    with conn.cursor() as cur:
+        cur.executemany(sql, rows)
+    conn.commit()
+
+
+def _update_signals_with_orders(
+    conn: psycopg.Connection,
+    rows: List[tuple],
+) -> None:
+    """
+    Batch update for order-related columns in signals table.
+    """
+    if not rows:
+        return
+
+    sql = """
+        UPDATE signals
+           SET order_env        = %s,
+               order_sent       = %s,
+               order_sent_time  = %s,
+               broker_order_id  = %s,
+               broker_trade_id  = %s,
+               allocation_block = %s,
+               order_units      = %s,
+               actual_entry_time  = %s,
+               actual_entry_price = %s,
+               actual_tp_price    = %s,
+               actual_exit_time   = %s,
+               actual_exit_price  = %s,
+               order_status       = %s,
+               slippage_pips      = %s,
+               profit_pips        = %s,
+               profit_ccy         = %s,
+               exec_latency_ms    = %s
+         WHERE signal_symbol = %s
+           AND position_type = %s
+           AND event_time    = %s
+           AND found_at      = %s
     """
     with conn.cursor() as cur:
         cur.executemany(sql, rows)
@@ -591,8 +727,6 @@ def _collect_pivots_from_registry(
 
         if len(out) >= max_lookback:
             break
-
-    print(f"[DEBUG] pivots collected for {symbol} {pivot_type}: {len(out)} items")
 
     return out
 
@@ -709,6 +843,13 @@ def _price_from_pips(symbol: str, price: Decimal, pips: Decimal) -> Decimal:
     return price + (pips * size)
 
 
+def _to_oanda_instrument(symbol: str) -> str:
+    """
+    Convert internal symbol like 'EUR/USD' to OANDA instrument 'EUR_USD'.
+    """
+    return symbol.replace("/", "_")
+
+
 # --------------------------------------------------------------------
 # Small utilities
 # --------------------------------------------------------------------
@@ -757,7 +898,7 @@ def _decide_side(
     symbol_upper = symbol.upper()
 
     in_same = symbol in same_group
-    in_opp  = symbol in opposite_group
+    in_opp = symbol in opposite_group
 
     if ref_type.upper() == "HIGH":
         if in_opp:

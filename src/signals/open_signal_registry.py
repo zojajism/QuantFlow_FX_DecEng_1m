@@ -1,4 +1,6 @@
 # file: src/signals/open_signal_registry.py
+# English-only comments
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -23,16 +25,31 @@ class OpenSignal:
     position_price: Decimal
     created_at: datetime
 
+    # Order-related fields (optional at first)
+    order_env: Optional[str] = None          # "demo" / "live"
+    broker_order_id: Optional[str] = None
+    broker_trade_id: Optional[str] = None
+    order_units: Optional[int] = None
+    actual_entry_time: Optional[datetime] = None
+    actual_entry_price: Optional[Decimal] = None
+    actual_tp_price: Optional[Decimal] = None
+    order_status: str = "none"               # none/pending/open/closed/...
+    exec_latency_ms: Optional[int] = None
+
 
 class OpenSignalRegistry:
     """
     In-memory registry of open signals that we want to track with ticks.
 
-    This is NOT about order execution. It only tracks:
+    This is NOT about order execution logic itself. It only tracks:
       - when a tick reaches target_price for a signal
       - sends a Telegram notification
       - updates the DB row for that signal
       - removes the signal from memory
+
+    Now it also stores optional order-related info for signals whose
+    orders were actually sent to the broker, and can be pruned when
+    broker closes the trade (sync_broker_orders).
     """
 
     def __init__(self) -> None:
@@ -48,6 +65,80 @@ class OpenSignalRegistry:
         with self._lock:
             lst = self._signals_by_symbol.setdefault(sig.symbol, [])
             lst.append(sig)
+
+    def attach_order_info(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        event_time: datetime,
+        order_env: str,
+        broker_order_id: Optional[str],
+        broker_trade_id: Optional[str],
+        order_units: Optional[int],
+        actual_entry_time: Optional[datetime],
+        actual_entry_price: Optional[Decimal],
+        actual_tp_price: Optional[Decimal],
+        order_status: str,
+        exec_latency_ms: Optional[int],
+    ) -> None:
+        """
+        Find the matching OpenSignal (by symbol, side, event_time) and
+        attach order-related information to it.
+        """
+        with self._lock:
+            signals = self._signals_by_symbol.get(symbol)
+            if not signals:
+                return
+
+            for sig in signals:
+                if (
+                    sig.side.lower() == side.lower()
+                    and sig.event_time == event_time
+                ):
+                    sig.order_env = order_env
+                    sig.broker_order_id = broker_order_id
+                    sig.broker_trade_id = broker_trade_id
+                    sig.order_units = order_units
+                    sig.actual_entry_time = actual_entry_time
+                    sig.actual_entry_price = actual_entry_price
+                    sig.actual_tp_price = actual_tp_price
+                    sig.order_status = order_status
+                    sig.exec_latency_ms = exec_latency_ms
+                    break
+
+    def remove_by_broker(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        event_time: datetime,
+    ) -> None:
+        """
+        Remove a signal when broker confirms the trade is closed.
+
+        Called from sync_broker_orders() using the same key triple
+        (symbol, side, event_time) that we use for attach_order_info.
+        """
+        with self._lock:
+            signals = self._signals_by_symbol.get(symbol)
+            if not signals:
+                return
+
+            survivors: List[OpenSignal] = []
+            for sig in signals:
+                if (
+                    sig.side.lower() == side.lower()
+                    and sig.event_time == event_time
+                ):
+                    # Drop this one
+                    continue
+                survivors.append(sig)
+
+            if survivors:
+                self._signals_by_symbol[symbol] = survivors
+            else:
+                self._signals_by_symbol.pop(symbol, None)
 
     def process_tick_for_symbol(
         self,
@@ -130,11 +221,7 @@ class OpenSignalRegistry:
         # 1) Telegram notification
         try:
             # Calculate actual realized pips at hit
-            pip_size = (
-                Decimal("0.01")
-                if ("JPY" in sig.symbol or "DXY" in sig.symbol)
-                else Decimal("0.0001")
-            )
+            pip_size = Decimal("0.01") if ("JPY" in sig.symbol or "DXY" in sig.symbol) else Decimal("0.0001")
             pips_realized = (hit_price - sig.position_price) / pip_size
 
             # For BUY, positive pips are profit; for SELL reverse sign
@@ -169,12 +256,12 @@ class OpenSignalRegistry:
         try:
             sql = """
                 UPDATE signals
-                SET hit_price = %s,
-                    hit_time  = %s
-                WHERE signal_symbol = %s
-                  AND position_type = %s
-                  AND event_time    = %s
-                  AND target_price  = %s
+                   SET hit_price = %s,
+                       hit_time  = %s
+                 WHERE signal_symbol = %s
+                   AND position_type = %s
+                   AND event_time    = %s
+                   AND target_price  = %s
             """
             with conn.cursor() as cur:
                 cur.execute(

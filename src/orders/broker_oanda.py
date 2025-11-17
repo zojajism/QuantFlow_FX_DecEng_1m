@@ -34,6 +34,7 @@ class BrokerClient:
         * create_market_order(...)
         * get_open_trades()
         * get_account_summary()
+        * get_trade(trade_id)
     """
 
     def __init__(self, config: BrokerConfig) -> None:
@@ -61,7 +62,7 @@ class BrokerClient:
         return resp.json()
 
     # ------------------------------------------------------------------
-    # Public API
+    # Public trading / account API
     # ------------------------------------------------------------------
     def create_market_order(
         self,
@@ -142,6 +143,15 @@ class BrokerClient:
         Fetch account summary (balance, margin, NAV, etc.).
         """
         path = f"/accounts/{self.config.account_id}/summary"
+        return self._get(path)
+
+    def get_trade(self, trade_id: str) -> Dict[str, Any]:
+        """
+        Fetch a single trade by ID.
+
+        This works for both OPEN and CLOSED trades.
+        """
+        path = f"/accounts/{self.config.account_id}/trades/{trade_id}"
         return self._get(path)
 
 
