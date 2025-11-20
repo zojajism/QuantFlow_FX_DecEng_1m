@@ -15,7 +15,6 @@ import psycopg
 
 from .broker_oanda import BrokerClient, create_client_from_env
 from telegram_notifier import notify_telegram, ChatType
-from signals.open_signal_registry import get_open_signal_registry  # NEW: for registry sync
 
 logger = logging.getLogger(__name__)
 
@@ -26,79 +25,48 @@ load_dotenv(dotenv_path=ENV_PATH, override=False)
 
 
 # ----------------------------------------------------------------------
-# Data model for order execution
+# Data structures
 # ----------------------------------------------------------------------
+
+
 @dataclass
 class OrderExecutionResult:
     """
-    Rich result object returned by send_market_order().
+    Summary of an order sent to the broker at SEND-TIME.
 
-    Used by:
-      - pivot_corr_engine.py (to populate signals table order_* fields)
-      - OpenSignalRegistry (for in-memory tracking)
-
-    Fields:
-      env:
-        "demo" / "live" (matches signals.order_env check constraint)
-      symbol:
-        Broker instrument, e.g. "EUR_USD"
-      side:
-        "buy" or "sell"
-      units:
-        Trade size as passed to send_market_order (positive integer)
-      tp_price:
-        Requested take-profit price (if any)
-
-      order_sent_time:
-        UTC timestamp when we started the broker call
-
-      broker_order_id:
-        OANDA order id (if we can extract it)
-      broker_trade_id:
-        OANDA trade id (if we can extract it)
-
-      actual_entry_time:
-        When the trade was opened (best-effort from broker response)
-      actual_entry_price:
-        Execution price (best-effort)
-      actual_tp_price:
-        TP price actually registered on the trade (best-effort; falls
-        back to tp_price if we cannot find a more precise value)
-
-      status:
-        One of: "none", "pending", "open", "closed", "cancelled",
-        "rejected", "error"  (must match signals.order_status_check)
-
-      exec_latency_ms:
-        Milliseconds between send start and response receive.
-
-      raw_response:
-        Original JSON response (for debugging/auditing).
+    This is created immediately after create_market_order and used to:
+      - populate signals table with basic order info
+      - seed OpenSignalRegistry with env, ids, etc.
+    More detailed fields (profit, final status) are filled by sync_broker_orders.
     """
 
-    env: str
-    symbol: str
-    side: str
-    units: int
-    tp_price: Optional[Decimal]
-    order_sent_time: datetime
+    env: str                          # "demo" / "live"
+    order_sent_time: datetime         # when we sent the order to the broker
 
-    broker_order_id: Optional[str] = None
-    broker_trade_id: Optional[str] = None
+    broker_order_id: Optional[str]    # OANDA order ID
+    broker_trade_id: Optional[str]    # OANDA trade ID (position opened/managed)
+    units: int                        # units we requested (signed by side)
 
-    actual_entry_time: Optional[datetime] = None
-    actual_entry_price: Optional[Decimal] = None
-    actual_tp_price: Optional[Decimal] = None
+    # Entry information as known right after send (may be None)
+    actual_entry_time: Optional[datetime]
+    actual_entry_price: Optional[Decimal]
+    actual_tp_price: Optional[Decimal]
 
-    status: str = "none"
-    exec_latency_ms: Optional[int] = None
+    # Initial status at send-time ("pending", "open", etc.)
+    status: str
 
+    # Network/processing latency between our send and broker response
+    exec_latency_ms: Optional[int]
+
+    # Raw full broker response (optional for debugging)
     raw_response: Optional[Dict[str, Any]] = None
 
 
 # ----------------------------------------------------------------------
-# Small helpers
+# Helpers
 # ----------------------------------------------------------------------
+
+
 def _pip_size(symbol: str) -> Decimal:
     s = symbol.upper()
     if "JPY" in s or "DXY" in s:
@@ -115,8 +83,10 @@ def _pips_diff(symbol: str, p1: Decimal, p2: Decimal) -> Decimal:
 
 
 # ----------------------------------------------------------------------
-# Broker client factory
+# Broker client
 # ----------------------------------------------------------------------
+
+
 def get_broker_client() -> BrokerClient:
     """
     Factory for a BrokerClient instance, using environment variables.
@@ -131,8 +101,10 @@ def get_broker_client() -> BrokerClient:
 
 
 # ----------------------------------------------------------------------
-# High-level send-order helper
+# High-level ORDER SEND
 # ----------------------------------------------------------------------
+
+
 def send_market_order(
     symbol: str,
     side: str,
@@ -143,192 +115,140 @@ def send_market_order(
     """
     High-level helper to send a simple market order with optional TP.
 
-    Parameters
-    ----------
-    symbol : str
-        Instrument symbol, e.g. "EUR_USD".
-    side : str
-        "buy" or "sell".
-    units : int
-        Trade size in units. This is the OANDA 'units' field.
-        Positive for buy, negative for sell; if you pass positive
-        the sign will be normalized based on 'side'.
-    tp_price : Decimal, optional
-        Absolute TP price, e.g. Decimal("1.09500").
-    client_order_id : str, optional
-        Optional id for tracking (will be set as clientExtensions.id in OANDA).
-
-    Returns
-    -------
-    OrderExecutionResult
-        Rich result object used by strategy and order-management layer.
+    Returns an OrderExecutionResult object summarizing:
+      - env, order_sent_time
+      - broker_order_id, broker_trade_id
+      - units, entry time/price, TP price
+      - initial status, exec latency
     """
     client = get_broker_client()
-    env_label = client.config.env  # "demo" / "live"
 
-    side_norm = side.lower().strip()
+    logger.info(
+        "Sending market order: symbol=%s side=%s units=%s tp_price=%s env=%s",
+        symbol,
+        side,
+        units,
+        tp_price,
+        client.config.env,
+    )
 
     before = datetime.now(timezone.utc)
-    print("Before send:", before.isoformat(timespec="milliseconds"))
+    response = client.create_market_order(
+        instrument=symbol,
+        side=side,
+        units=units,
+        tp_price=tp_price,
+        client_order_id=client_order_id,
+    )
+    after = datetime.now(timezone.utc)
 
-    try:
-        response = client.create_market_order(
-            instrument=symbol,
-            side=side_norm,
-            units=units,
-            tp_price=tp_price,
-            client_order_id=client_order_id,
-        )
-        after = datetime.now(timezone.utc)
-        print("After receive:", after.isoformat(timespec="milliseconds"))
+    # Compute latency in ms
+    exec_latency_ms: Optional[int] = int((after - before).total_seconds() * 1000)
 
-        latency_ms = int((after - before).total_seconds() * 1000)
+    # ------------------------------------------------------------------
+    # Parse broker_order_id and broker_trade_id from OANDA response
+    # ------------------------------------------------------------------
+    oft = response.get("orderFillTransaction", {}) or {}
+    octx = response.get("orderCreateTransaction", {}) or {}
 
-        logger.info("Order response from broker: %s", response)
+    # Order ID: prefer explicit orderID, fallback to createTransaction id
+    broker_order_id: Optional[str] = (
+        oft.get("orderID")
+        or octx.get("id")
+        or response.get("lastTransactionID")
+    )
+    if broker_order_id is not None:
+        broker_order_id = str(broker_order_id)
 
-        # Best-effort parsing of OANDA-style response
-        trade_tx = None
-        if isinstance(response, dict):
-            trade_tx = (
-                response.get("orderFillTransaction")
-                or response.get("tradeOpened")
-                or response.get("tradeReduced")
-                or response.get("orderCreateTransaction")
-            )
+    # Trade ID: several possible locations depending on account settings
+    trade_id: Optional[str] = None
 
-        broker_order_id: Optional[str] = None
-        broker_trade_id: Optional[str] = None
-        actual_entry_price: Optional[Decimal] = None
-        actual_entry_time: Optional[datetime] = None
-        actual_tp_price: Optional[Decimal] = None
+    trade_opened = oft.get("tradeOpened") or {}
+    if trade_opened:
+        trade_id = trade_opened.get("tradeID") or trade_opened.get("id")
 
-        if isinstance(trade_tx, dict):
-            # Try various fields OANDA uses
-            broker_order_id = trade_tx.get("orderID") or trade_tx.get("id")
-            broker_trade_id = trade_tx.get("tradeID") or trade_tx.get("id")
+    if trade_id is None:
+        trades_opened = oft.get("tradesOpened") or []
+        if trades_opened:
+            t0 = trades_opened[0] or {}
+            trade_id = t0.get("tradeID") or t0.get("id")
 
-            price_str = trade_tx.get("price") or trade_tx.get("openPrice")
-            if price_str is not None:
-                try:
-                    actual_entry_price = Decimal(str(price_str))
-                except Exception:
-                    actual_entry_price = None
+    # Last fallback: if broker returns direct "tradeID" at top level
+    if trade_id is None:
+        trade_id = oft.get("tradeID")
 
-            time_str = trade_tx.get("time") or trade_tx.get("openTime")
-            if time_str:
-                try:
-                    actual_entry_time = datetime.fromisoformat(
-                        time_str.replace("Z", "+00:00")
-                    )
-                except Exception:
-                    actual_entry_time = after
+    if trade_id is not None:
+        trade_id = str(trade_id)
 
-            # Sometimes TP appears on related fields; if not, we fall back to tp_price
-            tp_str = trade_tx.get("takeProfitOnFill", {}).get("price")
-            if tp_str is not None:
-                try:
-                    actual_tp_price = Decimal(str(tp_str))
-                except Exception:
-                    actual_tp_price = tp_price
-            else:
-                actual_tp_price = tp_price
-        else:
-            # No detailed transaction object; still return basic info
-            actual_tp_price = tp_price
-            actual_entry_time = after
+    # ------------------------------------------------------------------
+    # Entry time & price from fill transaction (if available)
+    # ------------------------------------------------------------------
+    actual_entry_time: Optional[datetime] = None
+    actual_entry_price: Optional[Decimal] = None
 
-        # Decide initial status (will be refined by sync_broker_orders)
-        if broker_trade_id:
-            status = "open"
-        elif broker_order_id:
-            status = "pending"
-        else:
-            status = "error"
+    price_str = oft.get("price")
+    time_str = oft.get("time")
 
-        return OrderExecutionResult(
-            env=env_label,
-            symbol=symbol,
-            side=side_norm,
-            units=units,
-            tp_price=tp_price,
-            order_sent_time=before,
-            broker_order_id=str(broker_order_id) if broker_order_id else None,
-            broker_trade_id=str(broker_trade_id) if broker_trade_id else None,
-            actual_entry_time=actual_entry_time,
-            actual_entry_price=actual_entry_price,
-            actual_tp_price=actual_tp_price,
-            status=status,
-            exec_latency_ms=latency_ms,
-            raw_response=response,
-        )
-
-    except Exception as e:
-        after = datetime.now(timezone.utc)
-        latency_ms = int((after - before).total_seconds() * 1000)
-
-        logger.exception("Exception while sending market order: %s", e)
+    if price_str is not None:
         try:
-            notify_telegram(
-                f"⛔️ Order send failed\n"
-                f"Symbol: {symbol}\nSide: {side_norm.upper()}\nUnits: {units}\n"
-                f"Error: {e}",
-                ChatType.ALERT,
-            )
+            actual_entry_price = Decimal(str(price_str))
         except Exception:
-            # Do not let Telegram errors propagate
-            pass
+            actual_entry_price = None
 
-        # Return an error result instead of raising, so caller
-        # (pivot_corr_engine) can still log/update DB safely.
-        return OrderExecutionResult(
-            env=env_label,
-            symbol=symbol,
-            side=side_norm,
-            units=units,
-            tp_price=tp_price,
-            order_sent_time=before,
-            broker_order_id=None,
-            broker_trade_id=None,
-            actual_entry_time=None,
-            actual_entry_price=None,
-            actual_tp_price=tp_price,
-            status="error",
-            exec_latency_ms=latency_ms,
-            raw_response={"error": str(e)},
-        )
+    if time_str:
+        try:
+            actual_entry_time = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
+        except Exception:
+            actual_entry_time = None
+
+    # TP price: we can use the explicit arg as our "intended TP";
+    # broker may manage TP as a separate order, but we store the target here.
+    actual_tp_price = tp_price
+
+    # Status at send-time: we mark as "pending"; later sync_broker_orders
+    # will update based on the actual trade state.
+    initial_status = "pending"
+
+    return OrderExecutionResult(
+        env=client.config.env,
+        order_sent_time=before,
+        broker_order_id=broker_order_id,
+        broker_trade_id=trade_id,
+        units=units,
+        actual_entry_time=actual_entry_time,
+        actual_entry_price=actual_entry_price,
+        actual_tp_price=actual_tp_price,
+        status=initial_status,
+        exec_latency_ms=exec_latency_ms,
+        raw_response=response,
+    )
 
 
 # ----------------------------------------------------------------------
-# DB-sync for broker orders (open & closed)
+# BROKER SYNC (open & closed states)
 # ----------------------------------------------------------------------
+
+
 def sync_broker_orders(conn: psycopg.Connection) -> None:
     """
-    Synchronize all signals that have been sent to the broker with the
-    actual trade state in OANDA.
+    Synchronize all broker-managed trades with the signals table.
 
     Behaviour:
-      - Reads all signals with order_sent = true AND broker_trade_id not null
-        AND order_env = current env AND order_status != 'closed'.
-      - Fetches open trades once, to know which tradeIDs are still open.
-      - For each signal:
-          * If trade is OPEN:
-                - ensure actual_entry_price/time are filled
-                - compute slippage_pips if possible
-                - set order_status='open'
-          * If trade is not in openTrades:
-                - fetch trade detail
-                - if state='CLOSED':
-                    - fill actual_exit_time, actual_exit_price
-                    - compute profit_pips, profit_ccy
-                    - compute slippage_pips if still null
-                    - set order_status='closed'
-                    - send Telegram notification
-                    - remove from OpenSignalRegistry
-                - if state other -> set order_status accordingly
+      - Load all signals with order_sent=true and broker_trade_id not null,
+        whose order_status is not 'closed'.
+      - Hit OANDA:
+          * get_open_trades() once
+          * get_trade(trade_id) for non-open trades
+      - Update:
+          * order_status (open/closed/cancelled/...)
+          * actual_entry_time/price
+          * actual_exit_time/price
+          * slippage_pips
+          * profit_pips, profit_ccy
+      - Send one "BROKER CLOSE" telegram when a trade transitions to closed.
     """
     client = get_broker_client()
     env = client.config.env  # 'demo' or 'live'
-    open_sig_registry = get_open_signal_registry()  # NEW: sync registry
 
     logger.info("[OrderSync] Starting broker sync for env=%s", env)
 
@@ -341,6 +261,7 @@ def sync_broker_orders(conn: psycopg.Connection) -> None:
             target_price,
             position_price,
             order_units,
+            broker_order_id,
             broker_trade_id,
             actual_entry_time,
             actual_entry_price,
@@ -370,6 +291,9 @@ def sync_broker_orders(conn: psycopg.Connection) -> None:
 
     updates: List[Tuple] = []
 
+    # ---------------------------------------------------------
+    # Process each signal row
+    # ---------------------------------------------------------
     for (
         event_time,
         symbol,
@@ -377,12 +301,14 @@ def sync_broker_orders(conn: psycopg.Connection) -> None:
         target_price,
         position_price,
         order_units,
+        broker_order_id,
         broker_trade_id,
         actual_entry_time,
         actual_entry_price,
         actual_tp_price,
         order_status,
     ) in rows:
+
         trade_id = str(broker_trade_id) if broker_trade_id is not None else None
         if not trade_id:
             continue
@@ -390,15 +316,17 @@ def sync_broker_orders(conn: psycopg.Connection) -> None:
         symbol_str = str(symbol)
         side = str(position_type).lower()
 
-        # Case A: trade still appears in openTrades
+        # ---------- Case A: trade still appears in openTrades ----------
         if trade_id in open_by_id:
             t = open_by_id[trade_id]
 
-            # Fill entry info from open trade if missing
             if actual_entry_price is None:
                 price_str = t.get("price")
                 if price_str is not None:
-                    actual_entry_price = Decimal(str(price_str))
+                    try:
+                        actual_entry_price = Decimal(str(price_str))
+                    except Exception:
+                        actual_entry_price = None
 
             if actual_entry_time is None:
                 open_time_str = t.get("openTime")
@@ -410,27 +338,25 @@ def sync_broker_orders(conn: psycopg.Connection) -> None:
                     except Exception:
                         actual_entry_time = None
 
-            # Compute slippage if possible
+            # Slippage
             slippage_pips: Optional[Decimal] = None
             if actual_entry_price is not None and position_price is not None:
                 planned = Decimal(str(position_price))
                 actual = Decimal(str(actual_entry_price))
-                # For slippage, sign "actual - planned" from perspective of execution
                 if side == "buy":
                     slippage_pips = _pips_diff(symbol_str, actual, planned)
                 else:
                     slippage_pips = _pips_diff(symbol_str, planned, actual)
 
-            # Prepare UPDATE for the OPEN trade
             updates.append(
                 (
-                    "open",                     # order_status
+                    "open",
                     actual_entry_time,
                     actual_entry_price,
                     actual_tp_price,
                     slippage_pips,
-                    None,                       # profit_pips
-                    None,                       # profit_ccy
+                    None,
+                    None,
                     event_time,
                     symbol_str,
                     position_type,
@@ -439,7 +365,7 @@ def sync_broker_orders(conn: psycopg.Connection) -> None:
             )
             continue
 
-        # Case B: trade is not open anymore -> query trade detail
+        # ---------- Case B: trade is not open anymore -> query detail ----------
         try:
             trade_detail = client.get_trade(trade_id)
         except Exception as e:
@@ -453,12 +379,12 @@ def sync_broker_orders(conn: psycopg.Connection) -> None:
         trade_obj = trade_detail.get("trade") or trade_detail.get("orderFillTransaction") or {}
         state = str(trade_obj.get("state", "")).upper()
 
-        # Fallbacks for fields
+        # Exit time & price
         close_time_str = trade_obj.get("closeTime") or trade_obj.get("time")
         exit_price_str = (
-            trade_obj.get("price")
-            or trade_obj.get("averageClosePrice")
+            trade_obj.get("averageClosePrice")
             or trade_obj.get("closePrice")
+            or trade_obj.get("price")
         )
         realized_pl_str = trade_obj.get("realizedPL")
 
@@ -473,13 +399,19 @@ def sync_broker_orders(conn: psycopg.Connection) -> None:
 
         actual_exit_price: Optional[Decimal] = None
         if exit_price_str is not None:
-            actual_exit_price = Decimal(str(exit_price_str))
+            try:
+                actual_exit_price = Decimal(str(exit_price_str))
+            except Exception:
+                actual_exit_price = None
 
-        # If we still don't know entry price/time, try to pick from trade object
+        # Ensure entry info is filled if still missing
         if actual_entry_price is None:
             open_price_str = trade_obj.get("price") or trade_obj.get("openPrice")
             if open_price_str is not None:
-                actual_entry_price = Decimal(str(open_price_str))
+                try:
+                    actual_entry_price = Decimal(str(open_price_str))
+                except Exception:
+                    actual_entry_price = None
 
         if actual_entry_time is None:
             open_time_str = trade_obj.get("openTime")
@@ -491,7 +423,7 @@ def sync_broker_orders(conn: psycopg.Connection) -> None:
                 except Exception:
                     actual_entry_time = None
 
-        # Compute slippage if possible
+        # Slippage
         slippage_pips: Optional[Decimal] = None
         if actual_entry_price is not None and position_price is not None:
             planned = Decimal(str(position_price))
@@ -501,7 +433,7 @@ def sync_broker_orders(conn: psycopg.Connection) -> None:
             else:
                 slippage_pips = _pips_diff(symbol_str, planned, actual)
 
-        # Compute realized profit if available
+        # Profit
         profit_ccy: Optional[Decimal] = None
         profit_pips: Optional[Decimal] = None
 
@@ -517,7 +449,7 @@ def sync_broker_orders(conn: psycopg.Connection) -> None:
             else:
                 profit_pips = _pips_diff(symbol_str, actual_entry_price, actual_exit_price)
 
-        # Decide final order_status
+        # Final status
         if state == "CLOSED":
             final_status = "closed"
         elif state in ("CANCELLED", "CANCELLED_BY_CLIENT"):
@@ -545,34 +477,37 @@ def sync_broker_orders(conn: psycopg.Connection) -> None:
             )
         )
 
-        # Telegram notification only if closed (normal close with price)
+        # ----------------- Broker close Telegram (single notif) -----------------
         if final_status == "closed" and actual_exit_price is not None:
             try:
-                msg_lines = [
+                msg_lines: List[str] = [
                     "✅ BROKER CLOSE",
-                    f"Symbol:        {symbol_str}",
-                    f"Side:          {side.upper()}",
-                    f"Units:         {order_units}",
+                    f"Symbol:       {symbol_str}",
+                    f"Side:         {side.upper()}",
+                    f"Units:        {order_units}",
                     "",
-                    f"Entry price:   {actual_entry_price}",
-                    f"Exit price:    {actual_exit_price}",
+                    f"Order ID:     {broker_order_id}",
+                    f"Trade ID:     {trade_id}",
+                    "",
+                    f"Entry price:  {actual_entry_price}",
+                    f"Exit price:   {actual_exit_price}",
                 ]
 
                 if profit_pips is not None:
-                    msg_lines.append(f"Pips:          {profit_pips:.1f}")
+                    msg_lines.append(f"Pips:         {profit_pips:.1f}")
                 if profit_ccy is not None:
-                    msg_lines.append(f"Profit:        {profit_ccy}")
+                    msg_lines.append(f"Profit:       {profit_ccy}")
 
                 msg_lines.append("")
-                msg_lines.append(f"Event time:    {event_time}")
+                msg_lines.append(f"Event time:   {event_time}")
                 if actual_exit_time is not None:
-                    msg_lines.append(f"Close time:    {actual_exit_time}")
+                    msg_lines.append(f"Close time:   {actual_exit_time}")
 
                 notify_telegram("\n".join(msg_lines), ChatType.INFO)
             except Exception as e:
                 logger.warning("[OrderSync] Telegram notify failed: %s", e)
 
-        # Also persist exit info into DB via separate statement
+        # Also persist exit info into DB (for closed trades with price)
         if final_status == "closed" and actual_exit_price is not None:
             sql_exit = """
                 UPDATE signals
@@ -597,20 +532,6 @@ def sync_broker_orders(conn: psycopg.Connection) -> None:
                     ),
                 )
             conn.commit()
-
-        # NEW: also remove from OpenSignalRegistry when broker says it's closed
-        if final_status == "closed":
-            try:
-                open_sig_registry.remove_by_broker(
-                    symbol=symbol_str,
-                    side=side,
-                    event_time=event_time,
-                )
-            except Exception as e:
-                logger.warning(
-                    "[OrderSync] Failed to remove signal from OpenSignalRegistry: %s",
-                    e,
-                )
 
     # Apply bulk updates for status, entry, slippage, profit
     if updates:
@@ -639,6 +560,8 @@ def sync_broker_orders(conn: psycopg.Connection) -> None:
 # ----------------------------------------------------------------------
 # Simple utilities for manual checks
 # ----------------------------------------------------------------------
+
+
 def print_account_summary() -> None:
     """
     Utility for quick manual checks: prints account summary.
@@ -689,6 +612,8 @@ def print_open_trades() -> None:
 # ----------------------------------------------------------------------
 # Logging setup for running this module directly
 # ----------------------------------------------------------------------
+
+
 def _configure_basic_logging() -> None:
     """
     Configure a simple console logger if the user runs this module directly.
@@ -720,25 +645,25 @@ if __name__ == "__main__":
     #     sync_broker_orders(conn)
 
     # Example interactive test order (commented out by default):
-    test_symbol = "EUR_USD"
-    test_side = "buy"
-    test_units = 1000
-    test_tp_price: Optional[Decimal] = None
-
-    confirm = input(
-        f"\nSend test market order on {test_symbol} side={test_side} "
-        f"units={test_units}? (y/N): "
-    ).strip().lower()
-
-    if confirm == "y":
-        resp = send_market_order(
-            symbol=test_symbol,
-            side=test_side,
-            units=test_units,
-            tp_price=test_tp_price,
-            client_order_id="quantflow-test-order",
-        )
-        print("\nOrder placed. Result object:")
-        print(resp)
-    else:
-        print("Skipped sending test order.")
+    # test_symbol = "EUR_USD"
+    # test_side = "buy"
+    # test_units = 1000
+    # test_tp_price: Optional[Decimal] = None
+    #
+    # confirm = input(
+    #     f"\nSend test market order on {test_symbol} side={test_side} "
+    #     f"units={test_units}? (y/N): "
+    # ).strip().lower()
+    #
+    # if confirm == "y":
+    #     resp = send_market_order(
+    #         symbol=test_symbol,
+    #         side=test_side,
+    #         units=test_units,
+    #         tp_price=test_tp_price,
+    #         client_order_id="quantflow-test-order",
+    #     )
+    #     print("\nOrder placed. Execution summary:")
+    #     print(resp)
+    # else:
+    #     print("Skipped sending test order.")

@@ -31,10 +31,10 @@ from orders.order_executor import send_market_order, OrderExecutionResult
 MAX_TICK_AGE_SEC = 10  # if last tick older than this (in seconds), fallback to candle close
 
 # Minimum pips distance to send order to broker
-MIN_PIPS_FOR_ORDER = Decimal("2")
+MIN_PIPS_FOR_ORDER = Decimal("5")
 
 # Simple default units for now; later this will be driven by risk model
-DEFAULT_ORDER_UNITS = 1000
+DEFAULT_ORDER_UNITS = 100000
 
 # NOTE: We DO NOT apply any min-pip filter to signal generation itself.
 # All signals are emitted and logged. Final "send or not send" filter
