@@ -30,15 +30,18 @@ from orders.order_executor import send_market_order, OrderExecutionResult
 
 MAX_TICK_AGE_SEC = 10  # if last tick older than this (in seconds), fallback to candle close
 
-# Minimum pips distance to send order to broker
+# Minimum pips distance to send order to broker (AFTER TP * 0.8 adjustment)
 MIN_PIPS_FOR_ORDER = Decimal("5")
 
 # Simple default units for now; later this will be driven by risk model
 DEFAULT_ORDER_UNITS = 100000
 
+# TP adjustment factor (only TP we use from now on)
+TP_ADJUST_FACTOR = Decimal("0.8")
+
 # NOTE: We DO NOT apply any min-pip filter to signal generation itself.
 # All signals are emitted and logged. Final "send or not send" filter
-# is applied before order sending (MIN_PIPS_FOR_ORDER).
+# is applied before order sending (MIN_PIPS_FOR_ORDER) AFTER adjustment.
 
 
 # --------------------------------------------------------------------
@@ -95,6 +98,7 @@ def run_decision_event(
       - logging ALL such signals (no pip-size filters here)
       - deduping so we don't spam duplicates
       - optionally sending orders to broker when |pips| >= MIN_PIPS_FOR_ORDER
+        AFTER applying TP_ADJUST_FACTOR (0.8).
 
     Risk & capital sizing logic will later live in a dedicated
     Order Management layer. For now we use DEFAULT_ORDER_UNITS.
@@ -338,13 +342,22 @@ def run_decision_event(
 
                     # 3) Compute targets (NO min-pip filter here for signal creation)
                     target_pips = _pips(tgt, tgt_pivot_price, position_price)
+
+                    # --- NEW RULE: immediately adjust TP (only TP we keep/use) ---
+                    target_pips = (target_pips * TP_ADJUST_FACTOR)
+
+                    # Build target price from adjusted TP
                     target_price = _price_from_pips(tgt, position_price, target_pips)
 
                     signal_memory.remember(
                         f"{tgt}|{side}|{found_at_minute.isoformat()}"
                     )
 
-                    # Print human-readable signal info
+                    # Decide BROKER eligibility using adjusted TP
+                    send_to_broker = abs(target_pips) >= MIN_PIPS_FOR_ORDER
+                    order_info: Optional[OrderExecutionResult] = None
+
+                    # Print human-readable signal info (still for all signals)
                     print(
                         "[SIGNAL] "
                         f"event_time={event_time} | target={tgt} | side={side} | "
@@ -354,37 +367,38 @@ def run_decision_event(
                         f"ref={ref_symbol} {ref_type} @ {pivot_time} | "
                         f"pivot_time(target)={tgt_pivot_time} | "
                         f"pivot_type(target)={tgt_pivot_type} | "
-                        f"price_source={price_source}"
+                        f"price_source={price_source} | "
+                        f"send_to_broker={send_to_broker}"
                     )
 
-                    # Telegram notification (multi-line, nicely formatted)
-                    try:
-                        profit_est = (target_pips / Decimal("10000")) * Decimal("5000")
-                        msg = (
-                            "⚡ Pivot Correlation Signal\n"
-                            f"Symbol:         {tgt}\n"
-                            f"Side:           {side.upper()}\n"
-                            f"Price source:   {price_source}\n\n"
-                            f"Entry price:    {position_price}\n"
-                            f"Target price:   {target_price}\n"
-                            f"Distance:       {target_pips} pips\n"
-                            f"Est. Profit:    ${profit_est}\n\n"
-                            f"Ref pivot:      {ref_symbol}  ({ref_type})\n"
-                            f"Ref pivot time: {pivot_time.strftime('%Y-%m-%d %H:%M')}\n\n"
-                            f"Target pivot time: {tgt_pivot_time.strftime('%Y-%m-%d %H:%M')}\n"
-                            f"Event time:        {event_time.strftime('%Y-%m-%d %H:%M')}\n\n"
-                            f"Confirm symbols: {confirm_syms_str}"
-                        )
-                        notify_telegram(msg, ChatType.INFO)
-                    except Exception as e:
-                        print(f"[WARN] telegram notify failed: {e}")
+                    # ------------------------------------------------
+                    # 6) Telegram ONLY for broker-sent signals
+                    # ------------------------------------------------
+                    if send_to_broker:
+                        try:
+                            profit_est = (target_pips / Decimal("10000")) * Decimal("5000")
+                            msg = (
+                                "⚡ Pivot Correlation Signal\n"
+                                f"Symbol:         {tgt}\n"
+                                f"Side:           {side.upper()}\n"
+                                f"Price source:   {price_source}\n\n"
+                                f"Entry price:    {position_price}\n"
+                                f"Target price:   {target_price}\n"
+                                f"Distance:       {target_pips} pips\n"
+                                f"Est. Profit:    ${profit_est}\n\n"
+                                f"Ref pivot:      {ref_symbol}  ({ref_type})\n"
+                                f"Ref pivot time: {pivot_time.strftime('%Y-%m-%d %H:%M')}\n\n"
+                                f"Target pivot time: {tgt_pivot_time.strftime('%Y-%m-%d %H:%M')}\n"
+                                f"Event time:        {event_time.strftime('%Y-%m-%d %H:%M')}\n\n"
+                                f"Confirm symbols: {confirm_syms_str}"
+                            )
+                            notify_telegram(msg, ChatType.INFO)
+                        except Exception as e:
+                            print(f"[WARN] telegram notify failed: {e}")
 
                     # ------------------------------------------------
-                    # 6) Decide whether to send order to broker
+                    # 7) Send order to broker if eligible
                     # ------------------------------------------------
-                    send_to_broker = abs(target_pips) >= MIN_PIPS_FOR_ORDER
-                    order_info: Optional[OrderExecutionResult] = None
-
                     if send_to_broker:
                         try:
                             instrument = _to_oanda_instrument(tgt)
@@ -406,7 +420,7 @@ def run_decision_event(
                             order_info = None
 
                     # ------------------------------------------------
-                    # 7) Register OpenSignal (with optional order info)
+                    # 8) Register OpenSignal (with optional order info)
                     # ------------------------------------------------
                     open_sig_registry.add_signal(
                         OpenSignal(
@@ -447,7 +461,7 @@ def run_decision_event(
                     )
 
                     # ------------------------------------------------
-                    # 8) Queue DB updates for order-related columns
+                    # 9) Queue DB updates for order-related columns
                     # ------------------------------------------------
                     if order_info is not None:
                         batch_order_updates.append((
@@ -477,7 +491,7 @@ def run_decision_event(
                         ))
 
                     # ------------------------------------------------
-                    # 9) Queue row for signals table INSERT
+                    # 10) Queue row for signals table INSERT
                     # ------------------------------------------------
                     if conn is not None:
                         batch_rows_signals.append((
@@ -487,8 +501,8 @@ def run_decision_event(
                             side,                   # position_type
                             price_source,           # price_source
                             position_price,         # position_price
-                            target_pips,            # target_pips
-                            target_price,           # target_price
+                            target_pips,            # target_pips (ADJUSTED)
+                            target_price,           # target_price (ADJUSTED)
                             ref_symbol,             # ref_symbol (context)
                             ref_type,               # ref_type (context)
                             pivot_time,             # pivot_time (ref anchor)
@@ -496,7 +510,7 @@ def run_decision_event(
                         ))
 
     # ----------------------------------------------------------------
-    # 10) Batch DB writes
+    # 11) Batch DB writes
     # ----------------------------------------------------------------
     if conn:
         if batch_rows_looplog:
