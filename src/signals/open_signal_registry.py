@@ -231,6 +231,7 @@ class OpenSignalRegistry:
             # Dollar profit with assumed $5000 position size
             profit_usd = pips_realized / Decimal("10000") * Decimal("5000")
 
+            '''
             msg = (
                 "🎯 TARGET HIT\n"
                 f"Symbol:         {sig.symbol}\n"
@@ -243,9 +244,11 @@ class OpenSignalRegistry:
                 f"Event time:     {sig.event_time.strftime('%Y-%m-%d %H:%M')}\n"
                 f"Hit time:       {hit_time.strftime('%Y-%m-%d %H:%M')}\n"
             )
-
+            
             notify_telegram(msg, ChatType.INFO)
-
+            
+            '''
+            
         except Exception as e:
             print(f"[WARN] telegram notify (target hit) failed: {e}")
 
