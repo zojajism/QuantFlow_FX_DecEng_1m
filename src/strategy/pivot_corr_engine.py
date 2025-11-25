@@ -30,18 +30,18 @@ from orders.order_executor import send_market_order, OrderExecutionResult
 
 MAX_TICK_AGE_SEC = 10  # if last tick older than this (in seconds), fallback to candle close
 
-# Minimum pips distance to send order to broker (AFTER TP * 0.8 adjustment)
+# Minimum pips distance to send order to broker
 MIN_PIPS_FOR_ORDER = Decimal("5")
+
+# TP adjustment rule: ALWAYS use 80% of computed pips
+TP_ADJUST_FACTOR = Decimal("0.8")
 
 # Simple default units for now; later this will be driven by risk model
 DEFAULT_ORDER_UNITS = 100000
 
-# TP adjustment factor (only TP we use from now on)
-TP_ADJUST_FACTOR = Decimal("0.8")
-
 # NOTE: We DO NOT apply any min-pip filter to signal generation itself.
 # All signals are emitted and logged. Final "send or not send" filter
-# is applied before order sending (MIN_PIPS_FOR_ORDER) AFTER adjustment.
+# is applied before order sending (MIN_PIPS_FOR_ORDER) AFTER TP_ADJUST_FACTOR.
 
 
 # --------------------------------------------------------------------
@@ -97,11 +97,16 @@ def run_decision_event(
       - deciding which symbols become "signal targets"
       - logging ALL such signals (no pip-size filters here)
       - deduping so we don't spam duplicates
-      - optionally sending orders to broker when |pips| >= MIN_PIPS_FOR_ORDER
-        AFTER applying TP_ADJUST_FACTOR (0.8).
+      - optionally sending orders to broker when |pips_adjusted| >= MIN_PIPS_FOR_ORDER
 
     Risk & capital sizing logic will later live in a dedicated
     Order Management layer. For now we use DEFAULT_ORDER_UNITS.
+
+    IMPORTANT:
+      - We ALWAYS apply TP_ADJUST_FACTOR (0.8) to computed pips immediately.
+      - From that point on, adjusted pips/price are the ONLY values used/stored.
+      - Broker send filter uses adjusted pips.
+      - Telegram only for broker-sent signals.
     """
     pivot_reg = get_pivot_registry()
     sig_registry = get_signal_registry()
@@ -340,29 +345,33 @@ def run_decision_event(
                         )
                         continue
 
-                    # 3) Compute targets (NO min-pip filter here for signal creation)
-                    target_pips = _pips(tgt, tgt_pivot_price, position_price)
+                    # ------------------------------------------------
+                    # 6) Compute targets (apply TP_ADJUST_FACTOR immediately)
+                    # ------------------------------------------------
+                    target_pips_raw = _pips(tgt, tgt_pivot_price, position_price)
 
-                    # --- NEW RULE: immediately adjust TP (only TP we keep/use) ---
-                    target_pips = (target_pips * TP_ADJUST_FACTOR)
+                    # Apply 0.8 rule right away; from now on this is THE TP
+                    target_pips = target_pips_raw * TP_ADJUST_FACTOR
 
-                    # Build target price from adjusted TP
+                    # Recompute target price based on adjusted pips
                     target_price = _price_from_pips(tgt, position_price, target_pips)
 
                     signal_memory.remember(
                         f"{tgt}|{side}|{found_at_minute.isoformat()}"
                     )
 
-                    # Decide BROKER eligibility using adjusted TP
+                    # ------------------------------------------------
+                    # 7) Decide whether to send order to broker (adjusted pips)
+                    # ------------------------------------------------
                     send_to_broker = abs(target_pips) >= MIN_PIPS_FOR_ORDER
                     order_info: Optional[OrderExecutionResult] = None
 
-                    # Print human-readable signal info (still for all signals)
+                    # Print human-readable signal info
                     print(
                         "[SIGNAL] "
                         f"event_time={event_time} | target={tgt} | side={side} | "
                         f"position_price={position_price} | target_price={target_price} | "
-                        f"target_pips={target_pips} | "
+                        f"target_pips={target_pips} (raw={target_pips_raw}) | "
                         f"confirm_symbols=[{confirm_syms_str}] | "
                         f"ref={ref_symbol} {ref_type} @ {pivot_time} | "
                         f"pivot_time(target)={tgt_pivot_time} | "
@@ -371,9 +380,7 @@ def run_decision_event(
                         f"send_to_broker={send_to_broker}"
                     )
 
-                    # ------------------------------------------------
-                    # 6) Telegram ONLY for broker-sent signals
-                    # ------------------------------------------------
+                    # Telegram notification ONLY for broker-eligible signals
                     if send_to_broker:
                         try:
                             profit_est = (target_pips / Decimal("10000")) * Decimal("5000")
@@ -396,9 +403,6 @@ def run_decision_event(
                         except Exception as e:
                             print(f"[WARN] telegram notify failed: {e}")
 
-                    # ------------------------------------------------
-                    # 7) Send order to broker if eligible
-                    # ------------------------------------------------
                     if send_to_broker:
                         try:
                             instrument = _to_oanda_instrument(tgt)
@@ -491,7 +495,7 @@ def run_decision_event(
                         ))
 
                     # ------------------------------------------------
-                    # 10) Queue row for signals table INSERT
+                    # 10) Queue row for signals table INSERT (adjusted pips/price)
                     # ------------------------------------------------
                     if conn is not None:
                         batch_rows_signals.append((
