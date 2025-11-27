@@ -8,7 +8,8 @@ from decimal import Decimal
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 
-import psycopg  # psycopg3
+import psycopg
+import requests  # psycopg3
 
 # Access CandleBuffer to read prices
 from buffers import buffer_initializer as buffers
@@ -356,6 +357,9 @@ def run_decision_event(
                     # Recompute target price based on adjusted pips
                     target_price = _price_from_pips(tgt, position_price, target_pips)
 
+                    # Round to broker-allowed precision (fixes PRICE_PRECISION_EXCEEDED)
+                    target_price = _round_price_for_broker(tgt, target_price)
+
                     signal_memory.remember(
                         f"{tgt}|{side}|{found_at_minute.isoformat()}"
                     )
@@ -383,7 +387,7 @@ def run_decision_event(
                     # Telegram notification ONLY for broker-eligible signals
                     if send_to_broker:
                         try:
-                            profit_est = (target_pips / Decimal("10000")) * Decimal("5000")
+                            profit_est = (DEFAULT_ORDER_UNITS * target_pips / 10000)
                             msg = (
                                 "⚡ Pivot Correlation Signal\n"
                                 f"Symbol:         {tgt}\n"
@@ -412,6 +416,14 @@ def run_decision_event(
                             )
                             order_units = DEFAULT_ORDER_UNITS
 
+                            print(
+                                "[ORDER] Sending market order:",
+                                f"instrument={instrument}",
+                                f"side={side}",
+                                f"units={order_units}",
+                                f"tp_price={target_price}",
+                            )
+
                             order_info = send_market_order(
                                 symbol=instrument,
                                 side=side,
@@ -419,9 +431,58 @@ def run_decision_event(
                                 tp_price=target_price,
                                 client_order_id=client_order_id,
                             )
-                        except Exception as e:
-                            print(f"[ORDER] Failed to send order for {tgt}: {e}")
+                        except requests.HTTPError as e:
+                            status = e.response.status_code if e.response is not None else "?"
+                            body = None
+                            if e.response is not None:
+                                try:
+                                    body = e.response.json()
+                                except Exception:
+                                    body = e.response.text
+                                notify_telegram(body, ChatType.ALERT)
+
+                            print(f"[ORDER] HTTP error {status} from OANDA: {body}")
                             order_info = None
+
+
+                        if order_info is None:
+                            print(
+                                f"[ORDER] send_market_order returned None for {tgt} "
+                                f"(side={side}, tp_price={target_price})"
+                            )
+                        else:
+                            cancel = None
+                            raw = getattr(order_info, "raw_response", None)
+                            if isinstance(raw, dict):
+                                cancel = raw.get("orderCancelTransaction")
+
+                            if cancel:
+                                reason = cancel.get("reason")
+                                print(f"[ORDER] Broker cancelled order. reason={reason}")
+
+                                # Optional telegram for cancel
+                                try:
+                                    msg = (
+                                        "🆑 Order cancelled\n"
+                                        f"Reason:         {reason}\n\n"
+                                        f"Symbol:         {tgt}\n"
+                                        f"Side:           {side.upper()}\n"
+                                        f"Price source:   {price_source}\n\n"
+                                        f"Entry price:    {position_price}\n"
+                                        f"Target price:   {target_price}\n"
+                                        f"Distance:       {target_pips} pips\n"
+                                        f"Est. Profit:    ${profit_est}\n\n"
+                                        f"Ref pivot:      {ref_symbol}  ({ref_type})\n"
+                                        f"Ref pivot time: {pivot_time.strftime('%Y-%m-%d %H:%M')}\n\n"
+                                        f"Target pivot time: {tgt_pivot_time.strftime('%Y-%m-%d %H:%M')}\n"
+                                        f"Event time:        {event_time.strftime('%Y-%m-%d %H:%M')}\n\n"
+                                        f"Confirm symbols: {confirm_syms_str}"
+                                    )
+                                    notify_telegram(msg, ChatType.INFO)
+                                except Exception as te:
+                                    print(f"[WARN] telegram cancel notify failed: {te}")
+
+                        
 
                     # ------------------------------------------------
                     # 8) Register OpenSignal (with optional order info)
@@ -867,6 +928,20 @@ def _to_oanda_instrument(symbol: str) -> str:
     """
     return symbol.replace("/", "_")
 
+def _round_price_for_broker(symbol: str, price: Decimal) -> Decimal:
+    """
+    Round price to the precision allowed by OANDA for this instrument.
+    Simple rule:
+      - JPY & DXY: 3 decimals
+      - Others (major FX): 5 decimals
+    """
+    s = symbol.upper()
+    if "JPY" in s or "DXY" in s:
+        decimals = 3
+    else:
+        decimals = 5
+    # Use Python's round, then wrap back into Decimal
+    return Decimal(str(round(price, decimals)))
 
 # --------------------------------------------------------------------
 # Small utilities
@@ -927,4 +1002,4 @@ def _decide_side(
         if in_opp:
             return "sell"
         # default and SAME:
-        return "buy"
+            return "buy"
