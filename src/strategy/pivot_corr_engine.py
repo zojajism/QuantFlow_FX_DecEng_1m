@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import threading
 from typing import Any, Dict, List, Optional, Tuple
@@ -31,7 +31,7 @@ from orders.order_executor import send_market_order, OrderExecutionResult
 
 MAX_TICK_AGE_SEC = 10  # if last tick older than this (in seconds), fallback to candle close
 
-# Minimum pips distance to send order to broker
+# Minimum pips distance to send order to broker (after TP_ADJUST_FACTOR)
 MIN_PIPS_FOR_ORDER = Decimal("5")
 
 # TP adjustment rule: ALWAYS use 80% of computed pips
@@ -40,9 +40,66 @@ TP_ADJUST_FACTOR = Decimal("0.8")
 # Simple default units for now; later this will be driven by risk model
 DEFAULT_ORDER_UNITS = 100000
 
+# News blocking window (minutes before/after now, in UTC)
+NEWS_BLOCK_WINDOW_MIN = 15
+
 # NOTE: We DO NOT apply any min-pip filter to signal generation itself.
 # All signals are emitted and logged. Final "send or not send" filter
 # is applied before order sending (MIN_PIPS_FOR_ORDER) AFTER TP_ADJUST_FACTOR.
+
+
+# --------------------------------------------------------------------
+# News filter
+# --------------------------------------------------------------------
+
+def blocked_by_news(conn: Optional[psycopg.Connection], currency: str) -> bool:
+    """
+    Check if a signal should be blocked due to economic news.
+
+    Returns True if there is any 'scheduled' event in news_events for the given
+    currency where event_time_utc is within +/- NEWS_BLOCK_WINDOW_MIN minutes
+    around current time (UTC).
+
+    If conn is None or a DB error occurs, we fail SAFE and return True.
+    """
+    if conn is None:
+        print(
+            f"[NEWS] No DB connection provided for blocked_by_news(currency={currency}), "
+            "failing safe (blocked=True)."
+        )
+        return True
+
+    now_utc = datetime.now(timezone.utc)
+    window_start = now_utc - timedelta(minutes=NEWS_BLOCK_WINDOW_MIN)
+    window_end = now_utc + timedelta(minutes=NEWS_BLOCK_WINDOW_MIN)
+
+    sql = """
+        SELECT 1
+          FROM news_events
+         WHERE affected_currency = %s
+           AND event_time_utc BETWEEN %s AND %s
+           AND status = 'scheduled'
+         LIMIT 1
+    """
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                sql,
+                (
+                    currency.upper(),
+                    window_start,
+                    window_end,
+                ),
+            )
+            row = cur.fetchone()
+            return row is not None
+    except Exception as exc:
+        print(
+            f"[NEWS] Error while checking news block for {currency}: {exc}. "
+            "Failing safe (blocked=True)."
+        )
+        return True
 
 
 # --------------------------------------------------------------------
@@ -98,14 +155,15 @@ def run_decision_event(
       - deciding which symbols become "signal targets"
       - logging ALL such signals (no pip-size filters here)
       - deduping so we don't spam duplicates
-      - optionally sending orders to broker when |pips_adjusted| >= MIN_PIPS_FOR_ORDER
+      - optionally sending orders to broker when adjusted pips >= MIN_PIPS_FOR_ORDER
+        AND news filter allows it (blocked_by_news == False)
 
     Risk & capital sizing logic will later live in a dedicated
     Order Management layer. For now we use DEFAULT_ORDER_UNITS.
 
     IMPORTANT:
       - We ALWAYS apply TP_ADJUST_FACTOR (0.8) to computed pips immediately.
-      - From that point on, adjusted pips/price are the ONLY values used/stored.
+      - From that point on, adjusted pips are the ONLY pips value used/stored.
       - Broker send filter uses adjusted pips.
       - Telegram only for broker-sent signals.
     """
@@ -306,8 +364,10 @@ def run_decision_event(
 
                     # ------------------------------------------------
                     # 4) Determine side (BUY/SELL) based on TARGET pivot type
+                    #    (kept as in your latest logic)
                     # ------------------------------------------------
                     side = "buy" if tgt_pivot_type == "HIGH" else "sell"
+                    side_upper = side.upper()
 
                     # ------------------------------------------------
                     # 5) Entry price: try Tick first, then candle-close fallback
@@ -347,27 +407,79 @@ def run_decision_event(
                         continue
 
                     # ------------------------------------------------
-                    # 6) Compute targets (apply TP_ADJUST_FACTOR immediately)
+                    # 6) Compute targets with correct TP direction
                     # ------------------------------------------------
-                    target_pips_raw = _pips(tgt, tgt_pivot_price, position_price)
+                    # Raw pips: pivot vs entry
+                    pip_size = _pip_size(tgt)
+                    target_pips_raw = (tgt_pivot_price - position_price) / pip_size
 
-                    # Apply 0.8 rule right away; from now on this is THE TP
-                    target_pips = target_pips_raw * TP_ADJUST_FACTOR
+                    # Always use absolute distance as "magnitude"
+                    target_pips_abs = abs(target_pips_raw)
 
-                    # Recompute target price based on adjusted pips
-                    target_price = _price_from_pips(tgt, position_price, target_pips)
+                    # Apply 0.8 rule immediately; from now this is THE TP distance
+                    target_pips = target_pips_abs * TP_ADJUST_FACTOR
+
+                    # Directional pips for price computation
+                    if side_upper == "BUY":
+                        signed_pips_for_price = target_pips
+                    else:  # SELL
+                        signed_pips_for_price = -target_pips
+
+                    # Compute TP price
+                    target_price = _price_from_pips(
+                        tgt, position_price, signed_pips_for_price
+                    )
+
+                    # Sanity check to avoid LOSING_TAKE_PROFIT scenario
+                    if side_upper == "BUY" and target_price <= position_price:
+                        print(
+                            "[SKIP] Invalid TP (BUY) - TP <= entry: "
+                            f"symbol={tgt}, entry={position_price}, tp={target_price}, "
+                            f"pips={target_pips} (raw={target_pips_raw})"
+                        )
+                        continue
+
+                    if side_upper == "SELL" and target_price >= position_price:
+                        print(
+                            "[SKIP] Invalid TP (SELL) - TP >= entry: "
+                            f"symbol={tgt}, entry={position_price}, tp={target_price}, "
+                            f"pips={target_pips} (raw={target_pips_raw})"
+                        )
+                        continue
 
                     # Round to broker-allowed precision (fixes PRICE_PRECISION_EXCEEDED)
                     target_price = _round_price_for_broker(tgt, target_price)
 
+                    # Remember in local memory (not used beyond presence)
                     signal_memory.remember(
                         f"{tgt}|{side}|{found_at_minute.isoformat()}"
                     )
 
                     # ------------------------------------------------
-                    # 7) Decide whether to send order to broker (adjusted pips)
+                    # 7) Decide whether to send order to broker
+                    #    (adjusted pips + news filter)
                     # ------------------------------------------------
-                    send_to_broker = abs(target_pips) >= MIN_PIPS_FOR_ORDER
+                    send_to_broker = target_pips >= MIN_PIPS_FOR_ORDER
+                    send_to_broker_for_notif = send_to_broker
+
+                    # News blocking: check BOTH base and quote currencies
+                    blocked_flag = False
+                    if send_to_broker:
+                        parts = tgt.upper().split("/")
+                        currs: List[str] = []
+                        if len(parts) == 1:
+                            currs = [parts[0]]
+                        else:
+                            currs = [parts[0], parts[1]]
+
+                        for ccy in currs:
+                            if blocked_by_news(conn, ccy):
+                                blocked_flag = True
+                                break
+
+                        if blocked_flag:
+                            send_to_broker = False
+
                     order_info: Optional[OrderExecutionResult] = None
 
                     # Print human-readable signal info
@@ -381,17 +493,41 @@ def run_decision_event(
                         f"pivot_time(target)={tgt_pivot_time} | "
                         f"pivot_type(target)={tgt_pivot_type} | "
                         f"price_source={price_source} | "
+                        f"blocked_by_news={blocked_flag} | "
                         f"send_to_broker={send_to_broker}"
                     )
 
-                    # Telegram notification ONLY for broker-eligible signals
+                    # Telegram notification ONLY for broker-eligible & not-blocked signals
                     if send_to_broker:
                         try:
                             profit_est = (DEFAULT_ORDER_UNITS * target_pips / 10000)
                             msg = (
                                 "⚡ Pivot Correlation Signal\n"
                                 f"Symbol:         {tgt}\n"
-                                f"Side:           {side.upper()}\n"
+                                f"Side:           {side_upper}\n"
+                                f"Price source:   {price_source}\n\n"
+                                f"Entry price:    {position_price}\n"
+                                f"Target price:   {target_price}\n"
+                                f"Distance:       {target_pips} pips\n"
+                                f"Est. Profit:    ${profit_est}\n\n"
+                                f"Ref pivot:      {ref_symbol}  ({ref_type})\n"
+                                f"Ref pivot time: {pivot_time.strftime('%Y-%m-%d %H:%M')}\n\n"
+                                f"Target pivot time: {tgt_pivot_time.strftime('%Y-%m-%d %H:%M')}\n"
+                                f"Event time:        {event_time.strftime('%Y-%m-%d %H:%M')}\n\n"
+                                f"Confirm symbols: {confirm_syms_str}"
+                            )
+                            notify_telegram(msg, ChatType.INFO)
+                        except Exception as e:
+                            print(f"[WARN] telegram notify failed: {e}")
+
+                    if send_to_broker_for_notif and blocked_flag:
+                        try:
+                            profit_est = (DEFAULT_ORDER_UNITS * target_pips / 10000)
+                            msg = (
+                                "🔲 Pivot Correlation Signal\n"
+                                f"blocked_by_news={blocked_flag}\n"
+                                f"Symbol:         {tgt}\n"
+                                f"Side:           {side_upper}\n"
                                 f"Price source:   {price_source}\n\n"
                                 f"Entry price:    {position_price}\n"
                                 f"Target price:   {target_price}\n"
@@ -444,7 +580,6 @@ def run_decision_event(
                             print(f"[ORDER] HTTP error {status} from OANDA: {body}")
                             order_info = None
 
-
                         if order_info is None:
                             print(
                                 f"[ORDER] send_market_order returned None for {tgt} "
@@ -466,7 +601,7 @@ def run_decision_event(
                                         "🆑 Order cancelled\n"
                                         f"Reason:         {reason}\n\n"
                                         f"Symbol:         {tgt}\n"
-                                        f"Side:           {side.upper()}\n"
+                                        f"Side:           {side_upper}\n"
                                         f"Price source:   {price_source}\n\n"
                                         f"Entry price:    {position_price}\n"
                                         f"Target price:   {target_price}\n"
@@ -481,8 +616,6 @@ def run_decision_event(
                                     notify_telegram(msg, ChatType.INFO)
                                 except Exception as te:
                                     print(f"[WARN] telegram cancel notify failed: {te}")
-
-                        
 
                     # ------------------------------------------------
                     # 8) Register OpenSignal (with optional order info)
@@ -566,12 +699,13 @@ def run_decision_event(
                             side,                   # position_type
                             price_source,           # price_source
                             position_price,         # position_price
-                            target_pips,            # target_pips (ADJUSTED)
+                            target_pips,            # target_pips (ADJUSTED, magnitude)
                             target_price,           # target_price (ADJUSTED)
                             ref_symbol,             # ref_symbol (context)
                             ref_type,               # ref_type (context)
                             pivot_time,             # pivot_time (ref anchor)
                             found_at_minute,        # found_at (target pivot time)
+                            blocked_flag,           # blocked_by_news
                         ))
 
     # ----------------------------------------------------------------
@@ -720,8 +854,9 @@ def _insert_signals(conn: psycopg.Connection, rows: List[tuple]) -> None:
             ref_symbol,
             ref_type,
             pivot_time,
-            found_at
-        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            found_at,
+            blocked_by_news
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """
     with conn.cursor() as cur:
         cur.executemany(sql, rows)
@@ -908,6 +1043,7 @@ def _pip_size(symbol: str) -> Decimal:
 def _pips(symbol: str, pivot_price: Decimal, price: Decimal) -> Decimal:
     """
     (pivot_price - price) expressed in pips (signed).
+    NOTE: Currently not used directly for TP direction; we keep it for reference.
     """
     size = _pip_size(symbol)
     return (pivot_price - price) / size
@@ -928,6 +1064,7 @@ def _to_oanda_instrument(symbol: str) -> str:
     """
     return symbol.replace("/", "_")
 
+
 def _round_price_for_broker(symbol: str, price: Decimal) -> Decimal:
     """
     Round price to the precision allowed by OANDA for this instrument.
@@ -942,6 +1079,7 @@ def _round_price_for_broker(symbol: str, price: Decimal) -> Decimal:
         decimals = 5
     # Use Python's round, then wrap back into Decimal
     return Decimal(str(round(price, decimals)))
+
 
 # --------------------------------------------------------------------
 # Small utilities
@@ -1002,4 +1140,4 @@ def _decide_side(
         if in_opp:
             return "sell"
         # default and SAME:
-            return "buy"
+        return "buy"
