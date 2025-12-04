@@ -26,7 +26,7 @@ def get_last_n_candles(
 
 
 def update_pivot_buffers_for_symbol(
-    candle_registry,                   # CandleBuffer instance
+    candle_registry,
     pivot_registry: PivotBufferRegistry,
     exchange: str,
     symbol: str,
@@ -35,8 +35,10 @@ def update_pivot_buffers_for_symbol(
     n: int = 5,
     eps: float = 1e-9,
     strict: bool = False,
-    hit_strict: bool = True
+    hit_strict: bool = False,
+    hit_tolerance_pips: float = 2.0,   # << new
 ):
+
     """
     Compute pivots for one (exchange, symbol, timeframe) and merge them into the
     PivotBufferRegistry while keeping buffers time-sorted by CLOSE time (p.time).
@@ -45,11 +47,18 @@ def update_pivot_buffers_for_symbol(
 
     peaks, lows = compute_pivots(
         candles,
-        n=n, eps=eps,
-        high_key="High", low_key="Low",
-        time_key="CloseTime", open_time_key="OpenTime",
-        strict=strict, hit_strict=hit_strict
+        n=n,
+        eps=eps,
+        symbol=symbol,                      # << NEW: for pip size
+        high_key="High",
+        low_key="Low",
+        time_key="CloseTime",
+        open_time_key="OpenTime",
+        strict=strict,
+        hit_strict=hit_strict,
+        hit_tolerance_pips=hit_tolerance_pips,   # << NEW: 2-pip “near-hit”
     )
+
 
     pb = pivot_registry.get(exchange, symbol, timeframe)
 
@@ -78,7 +87,7 @@ def update_pivot_buffers_for_symbol(
 
 def execute_strategy(
     close_time: Any,
-    candle_registry,                # CandleBuffer
+    candle_registry,
     pivot_registry: PivotBufferRegistry,
     timeframe: str,
     symbols: List[Tuple[str, str]],
@@ -86,8 +95,10 @@ def execute_strategy(
     n: int = 5,
     eps: float = 1e-9,
     strict: bool = False,
-    hit_strict: bool = True
+    hit_strict: bool = False,
+    hit_tolerance_pips: float = 2.0,   # << new
 ):
+
     """
     Called once all required symbols have delivered the candle for `close_time`.
     1) Update pivot buffers per symbol
@@ -108,8 +119,13 @@ def execute_strategy(
             exchange=exch,
             symbol=sym,
             timeframe=timeframe,
-            n=n, eps=eps, strict=strict, hit_strict=hit_strict
+            n=n,
+            eps=eps,
+            strict=strict,
+            hit_strict=hit_strict,
+            hit_tolerance_pips=hit_tolerance_pips,   # << pass through
         )
+
 
         pb = pivot_registry.get(exch, sym, timeframe)
         print(

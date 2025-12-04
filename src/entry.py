@@ -2,8 +2,11 @@
 # English-only comments
 
 from datetime import datetime
+from pathlib import Path
 from typing import List, Tuple, Any, Dict
 import threading
+
+import yaml
 
 from sync.symbol_close_gate import SymbolCloseGate
 from pivots.pivot_buffer import PivotBufferRegistry
@@ -15,28 +18,40 @@ from database.db_general import get_pg_conn
 # NEW: broker sync (order management)
 from orders.order_executor import sync_broker_orders
 
+from public_module import config_data
+
+symbols = [str(s) for s in config_data.get("symbols", [])]
+timeframes = [str(t) for t in config_data.get("timeframes", [])]
 
 # ---- Configuration ----
-TIMEFRAME = "1m"
+# Use the first timeframe in config (e.g., "1m")
+TIMEFRAME: str = timeframes[0] if timeframes else "1m"
+
+# Convert symbol list into expected (broker, symbol) tuples
 EXPECTED_SYMBOLS: List[Tuple[str, str]] = [
-    ("OANDA", "EUR/USD"),
-    ("OANDA", "GBP/USD"),
-    ("OANDA", "AUD/USD"),
-    ("OANDA", "USD/CHF"),
-    ("OANDA", "DXY/DXY"),
+    ("OANDA", sym) for sym in symbols
 ]
 
+# ---- GROUPING (names don't matter) ----
+# Prepare SYMBOL_GROUPS dictionary
+SYMBOL_GROUPS: Dict[str, List[str]] = {}
+
+for key, value in config_data.items():
+    if key.startswith("SYMBOL_GROUPS_"):
+        group_name = key.replace("SYMBOL_GROUPS_", "")  # e.g., USD_Majors
+        SYMBOL_GROUPS[group_name] = [str(sym) for sym in value]
+
+PIVOT_SIDE_CANDLES = int(config_data.get("PIVOT_SIDE_CANDLES", [5])[0])
+PIVOT_HIT_TOLERANCE_PIPS = float(config_data.get("PIVOT_HIT_TOLERANCE_PIPS", [2])[0])
+
+#==================================================================================================================================
 
 def minute_trunc(dt: datetime) -> datetime:
     """Truncate to minute precision (zero sec/microsec)."""
     return dt.replace(second=0, microsecond=0)
 
 
-# ---- GROUPING (names don't matter) ----
-SYMBOL_GROUPS: Dict[str, List[str]] = {
-    "USD_Majors": ["EUR/USD", "GBP/USD", "AUD/USD"],
-    "DXY_Mirror": ["USD/CHF", "DXY/DXY"],
-}
+        
 # Or single group:
 # SYMBOL_GROUPS = {"All": [s for _, s in EXPECTED_SYMBOLS]}
 
@@ -183,15 +198,17 @@ def on_candle_closed(exchange: str, symbol: str, timeframe: str, close_time: Any
     # --- Compute/update pivots into the shared registry ---
     execute_strategy(
         close_time=event_time,
-        candle_registry=_candle_buffer,   # CandleBuffer
-        pivot_registry=_pivot_registry,   # shared PivotBufferRegistry
+        candle_registry=_candle_buffer,
+        pivot_registry=_pivot_registry,
         timeframe=TIMEFRAME,
         symbols=EXPECTED_SYMBOLS,
-        n=5,
+        n=PIVOT_SIDE_CANDLES,
         eps=1e-9,
         strict=False,
-        hit_strict=True,
+        hit_strict=False,         # << changed
+        hit_tolerance_pips=PIVOT_HIT_TOLERANCE_PIPS,   # << new
     )
+
 
     # --- Snapshot all pivots into pivot_list (async) ---
     try:

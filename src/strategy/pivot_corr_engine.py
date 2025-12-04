@@ -29,19 +29,18 @@ from signals.open_signal_registry import get_open_signal_registry, OpenSignal
 
 from orders.order_executor import send_market_order, OrderExecutionResult
 
+from public_module import config_data
+
 MAX_TICK_AGE_SEC = 10  # if last tick older than this (in seconds), fallback to candle close
 
-# Minimum pips distance to send order to broker (after TP_ADJUST_FACTOR)
-MIN_PIPS_FOR_ORDER = Decimal("5")
-
 # TP adjustment rule: ALWAYS use 80% of computed pips
-TP_ADJUST_FACTOR = Decimal("0.8")
+TP_ADJUST_FACTOR = Decimal(config_data.get("TP_ADJUST_FACTOR", 0.9)[0])
 
 # Simple default units for now; later this will be driven by risk model
-DEFAULT_ORDER_UNITS = 100000
+DEFAULT_ORDER_UNITS = int(config_data.get("DEFAULT_ORDER_UNITS", 10000)[0])
 
 # News blocking window (minutes before/after now, in UTC)
-NEWS_BLOCK_WINDOW_MIN = 15
+NEWS_BLOCK_WINDOW_MIN = int(config_data.get("NEWS_BLOCK_WINDOW_MIN", 30)[0])
 
 # NOTE: We DO NOT apply any min-pip filter to signal generation itself.
 # All signals are emitted and logged. Final "send or not send" filter
@@ -372,7 +371,7 @@ def run_decision_event(
                     # ------------------------------------------------
                     # 5) Entry price: try Tick first, then candle-close fallback
                     # ------------------------------------------------
-                    position_price, price_source = _get_entry_price_with_tick_fallback(
+                    position_price, price_source, spread = _get_entry_price_with_tick_fallback(
                         tick_registry=tick_registry,
                         exchange=exchange,
                         symbol=tgt,
@@ -459,7 +458,7 @@ def run_decision_event(
                     # 7) Decide whether to send order to broker
                     #    (adjusted pips + news filter)
                     # ------------------------------------------------
-                    send_to_broker = target_pips >= MIN_PIPS_FOR_ORDER
+                    send_to_broker = target_pips > spread * 2
                     send_to_broker_for_notif = send_to_broker
 
                     # News blocking: check BOTH base and quote currencies
@@ -487,7 +486,7 @@ def run_decision_event(
                         "[SIGNAL] "
                         f"event_time={event_time} | target={tgt} | side={side} | "
                         f"position_price={position_price} | target_price={target_price} | "
-                        f"target_pips={target_pips} (raw={target_pips_raw}) | "
+                        f"target_pips={target_pips:.1f} (raw={target_pips_raw}) | "
                         f"confirm_symbols=[{confirm_syms_str}] | "
                         f"ref={ref_symbol} {ref_type} @ {pivot_time} | "
                         f"pivot_time(target)={tgt_pivot_time} | "
@@ -500,7 +499,11 @@ def run_decision_event(
                     # Telegram notification ONLY for broker-eligible & not-blocked signals
                     if send_to_broker:
                         try:
-                            profit_est = (DEFAULT_ORDER_UNITS * target_pips / 10000)
+                            if tgt == "USD/JPY":
+                                profit_est = (DEFAULT_ORDER_UNITS * target_pips / 100)
+                            else:
+                                profit_est = (DEFAULT_ORDER_UNITS * target_pips / 10000)
+
                             msg = (
                                 "⚡ Pivot Correlation Signal\n"
                                 f"Symbol:         {tgt}\n"
@@ -508,7 +511,7 @@ def run_decision_event(
                                 f"Price source:   {price_source}\n\n"
                                 f"Entry price:    {position_price}\n"
                                 f"Target price:   {target_price}\n"
-                                f"Distance:       {target_pips} pips\n"
+                                f"Distance:       {target_pips:.1f} pips\n"
                                 f"Est. Profit:    ${profit_est}\n\n"
                                 f"Ref pivot:      {ref_symbol}  ({ref_type})\n"
                                 f"Ref pivot time: {pivot_time.strftime('%Y-%m-%d %H:%M')}\n\n"
@@ -522,7 +525,11 @@ def run_decision_event(
 
                     if send_to_broker_for_notif and blocked_flag:
                         try:
-                            profit_est = (DEFAULT_ORDER_UNITS * target_pips / 10000)
+                            if tgt == "USD/JPY":
+                                profit_est = (DEFAULT_ORDER_UNITS * target_pips / 100)
+                            else:
+                                profit_est = (DEFAULT_ORDER_UNITS * target_pips / 10000)
+
                             msg = (
                                 "🔲 Pivot Correlation Signal\n"
                                 f"blocked_by_news={blocked_flag}\n"
@@ -531,7 +538,7 @@ def run_decision_event(
                                 f"Price source:   {price_source}\n\n"
                                 f"Entry price:    {position_price}\n"
                                 f"Target price:   {target_price}\n"
-                                f"Distance:       {target_pips} pips\n"
+                                f"Distance:       {target_pips:.1f} pips\n"
                                 f"Est. Profit:    ${profit_est}\n\n"
                                 f"Ref pivot:      {ref_symbol}  ({ref_type})\n"
                                 f"Ref pivot time: {pivot_time.strftime('%Y-%m-%d %H:%M')}\n\n"
@@ -970,6 +977,10 @@ def _get_entry_price_with_tick_fallback(
     Returns:
       (price, source) where source in {"tick", "candle_close", "none"}.
     """
+
+    #if we found the real spread based on the tick data, we will use it, otherwise, we consider it as 2 pip
+    Spread = 2
+
     price_source = "none"
     try:
         tick = tick_registry.get_last_tick(exchange, symbol)
@@ -989,15 +1000,22 @@ def _get_entry_price_with_tick_fallback(
             else:  # SELL
                 px = Decimal(str(tick.bid))
             price_source = "tick"
-            return px, price_source
+           
+            Spread = Decimal(str(tick.ask)) - Decimal(str(tick.bid))
+            if symbol == "USD/JPY":
+                Spread = Spread * 100
+            else:
+                Spread = Spread * 10000
+
+            return px, price_source, Spread
 
     # Fallback to latest candle close
     close_px = _get_latest_close_price(exchange, symbol, timeframe)
     if close_px is not None:
         price_source = "candle_close"
-        return close_px, price_source
+        return close_px, price_source, Spread
 
-    return None, price_source
+    return None, price_source, Spread
 
 
 def _get_latest_close_price(

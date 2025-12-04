@@ -22,6 +22,8 @@ from signals.open_signal_registry import get_open_signal_registry
 
 from database.db_general import get_pg_conn
 
+from public_module import config_data
+
 Candle_SUBJECT = "candles.>"   
 Candle_STREAM = "STREAM_CANDLES"   
 
@@ -30,11 +32,6 @@ Tick_STREAM  = "STREAM_TICKS"
 
 Tick_DURABLE_NAME = 'candle-FX-DecEng-1m'
 Candle_DURABLE_NAME = 'tick-FX-DecEng-1m'
-
-CONFIG_PATH = Path("/data/config.yaml")
-if not CONFIG_PATH.exists():
-    CONFIG_PATH = Path(__file__).resolve().parent / "data" / "config.yaml"
-
 
 async def main():
 
@@ -63,12 +60,6 @@ async def main():
                 )
         notify_telegram(f"❇️ QuantFlow_Fx_DecEng_1m started....", ChatType.ALERT)
 
-
-        if not CONFIG_PATH.exists():
-            raise FileNotFoundError(f"Config file not found: {CONFIG_PATH}")
-
-        with CONFIG_PATH.open("r", encoding="utf-8") as f:
-            config_data = yaml.safe_load(f) or {}
 
         symbols = [str(s) for s in config_data.get("symbols", [])]
         timeframes = [str(t) for t in config_data.get("timeframes", [])]
@@ -106,7 +97,7 @@ async def main():
             )
         )
 
-        # --- Consumer ۲: Candle Engine
+        # --- Consumer 2: Candle Engine
         try:
             await js.delete_consumer(Candle_STREAM, Candle_DURABLE_NAME)
         except Exception:
@@ -206,7 +197,7 @@ async def main():
                             key = Keys(exchange, symbol, timeframe)
                             buffers.CANDLE_BUFFER.append(key, candle_data)
 
-                            on_candle_closed(exchange, symbol, "1m", candle_data["close_time"])
+                            on_candle_closed(exchange, symbol, timeframe, candle_data["close_time"])
                         #========== Main section, getting the candles we need ====================================
                         
                         await msg.ack()
