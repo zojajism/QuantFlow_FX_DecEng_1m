@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import public_module
+
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import threading
@@ -27,9 +29,13 @@ from buffers.tick_registry_provider import get_tick_registry
 
 from signals.open_signal_registry import get_open_signal_registry, OpenSignal
 
-from orders.order_executor import send_market_order, OrderExecutionResult
+from orders.order_executor import send_market_order, OrderExecutionResult, update_account_summary
 
-from public_module import config_data
+from public_module import config_data, check_available_required_margine
+
+from orders.broker_oanda import create_client_from_env
+
+import math
 
 MAX_TICK_AGE_SEC = 10  # if last tick older than this (in seconds), fallback to candle close
 
@@ -46,7 +52,6 @@ NEWS_BLOCK_WINDOW_MIN = int(config_data.get("NEWS_BLOCK_WINDOW_MIN", 30)[0])
 # All signals are emitted and logged. Final "send or not send" filter
 # is applied before order sending (MIN_PIPS_FOR_ORDER) AFTER TP_ADJUST_FACTOR.
 
-import math
 
 def truncate(value: float, decimals: int) -> float:
     factor = 10 ** decimals
@@ -465,7 +470,12 @@ def run_decision_event(
                     # ------------------------------------------------
                     send_to_broker = target_pips > spread
                     send_to_broker_for_notif = send_to_broker
-        
+                    send_to_broker_for_margine_check = send_to_broker
+
+                    margine_ok, mergine_required = check_available_required_margine(tgt, DEFAULT_ORDER_UNITS)
+                    send_to_broker = margine_ok
+
+                    print(f"margine_ok: {margine_ok}, margine_req:{mergine_required}")
                     # price_source == "candle_close" usually means we are at some points like market close or some specific situation that we are not receiving tick data
                     # which means there is no reliable data, so we do not send any order to Broker
                     if price_source == "candle_close":
@@ -499,6 +509,7 @@ def run_decision_event(
                         f"position_price={truncate(position_price,5)} | target_price={truncate(target_price,5)} | "
                         f"target_pips={truncate(target_pips,2)} (raw={truncate(target_pips_raw,2)}) | "
                         f"spread={truncate(spread,1)} | "
+                        f"mergine_required=${mergine_required} |"
                         f"confirm_symbols=[{confirm_syms_str}] | "
                         f"ref={ref_symbol} {ref_type} @ {pivot_time} | "
                         f"pivot_time(target)={tgt_pivot_time} | "
@@ -529,6 +540,7 @@ def run_decision_event(
                                 f"Target price:   {truncate(target_price,5)}\n"
                                 f"Distance:       {truncate(target_pips,2)} pips\n"
                                 f"Spread:         {truncate(spread,2)}\n"
+                                f"mergine_required: ${mergine_required}\n"
                                 f"Est. Profit:    ${truncate(profit_est,2)}\n\n"
                                 f"Ref pivot:      {ref_symbol}  ({ref_type})\n"
                                 f"Ref pivot time: {pivot_time.strftime('%Y-%m-%d %H:%M')}\n\n"
@@ -558,6 +570,37 @@ def run_decision_event(
                                 f"Distance:       {truncate(target_pips,2)} pips\n"
                                 f"Spread:         {truncate(spread,1)}\n"
                                 f"Est. Profit:    ${truncate(profit_est,2)}\n\n"
+                                f"Ref pivot:      {ref_symbol}  ({ref_type})\n"
+                                f"Ref pivot time: {pivot_time.strftime('%Y-%m-%d %H:%M')}\n\n"
+                                f"Target pivot time: {tgt_pivot_time.strftime('%Y-%m-%d %H:%M')}\n"
+                                f"Event time:        {event_time.strftime('%Y-%m-%d %H:%M')}\n\n"
+                                f"Confirm symbols: {confirm_syms_str}"
+                            )
+                            notify_telegram(msg, ChatType.INFO)
+                        except Exception as e:
+                            print(f"[WARN] telegram notify failed: {e}")
+
+                   
+                    if send_to_broker_for_margine_check and not margine_ok:
+                        try:
+                            if tgt == "USD/JPY":
+                                profit_est = (DEFAULT_ORDER_UNITS * target_pips / 100)
+                            else:
+                                profit_est = (DEFAULT_ORDER_UNITS * target_pips / 10000)
+
+                            msg = (
+                                "Ⓜ️ Pivot Correlation Signal\n"
+                                f"blocked_by_margine={margine_ok}\n"
+                                f"Symbol:         {tgt}\n"
+                                f"Side:           {side_upper}\n"
+                                f"Price source:   {price_source}\n\n"
+                                f"Entry price:    {truncate(position_price,5)}\n"
+                                f"Target price:   {truncate(target_price,5)}\n"
+                                f"Distance:       {truncate(target_pips,2)} pips\n"
+                                f"Spread:         {truncate(spread,1)}\n"
+                                f"Est. Profit:    ${truncate(profit_est,2)}\n\n"
+                                f"mergine_required: ${mergine_required}\n"
+                                f"mergine_available: ${round(public_module.margin_available,3)}\n"
                                 f"Ref pivot:      {ref_symbol}  ({ref_type})\n"
                                 f"Ref pivot time: {pivot_time.strftime('%Y-%m-%d %H:%M')}\n\n"
                                 f"Target pivot time: {tgt_pivot_time.strftime('%Y-%m-%d %H:%M')}\n"
@@ -642,7 +685,11 @@ def run_decision_event(
                                     notify_telegram(msg, ChatType.INFO)
                                 except Exception as te:
                                     print(f"[WARN] telegram cancel notify failed: {te}")
-
+                            
+                            else: # when got order info and it's not cancel
+                                update_account_summary()
+                                print("Balance:", public_module.balance)
+                                print("Available margin:", public_module.margin_available)  
                     # ------------------------------------------------
                     # 8) Register OpenSignal (with optional order info)
                     # ------------------------------------------------

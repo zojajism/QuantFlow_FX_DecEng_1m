@@ -24,6 +24,8 @@ from database.db_general import get_pg_conn
 
 from public_module import config_data
 
+from orders.order_executor import update_account_summary
+
 Candle_SUBJECT = "candles.>"   
 Candle_STREAM = "STREAM_CANDLES"   
 
@@ -59,7 +61,8 @@ async def main():
                         })
                 )
         notify_telegram(f"❇️ QuantFlow_Fx_DecEng_1m started....", ChatType.ALERT)
-
+        
+        update_account_summary()
 
         symbols = [str(s) for s in config_data.get("symbols", [])]
         timeframes = [str(t) for t in config_data.get("timeframes", [])]

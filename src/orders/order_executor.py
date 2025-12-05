@@ -18,6 +18,8 @@ from telegram_notifier import notify_telegram, ChatType
 
 import math
 
+import public_module
+
 def truncate(value: float, decimals: int) -> float:
     factor = 10 ** decimals
     return math.trunc(value * factor) / factor
@@ -105,11 +107,13 @@ def get_broker_client() -> BrokerClient:
     )
     return client
 
-
 # ----------------------------------------------------------------------
 # High-level ORDER SEND
 # ----------------------------------------------------------------------
 
+def update_account_summary():
+    client = create_client_from_env()
+    client.update_account_summary()
 
 def send_market_order(
     symbol: str,
@@ -236,6 +240,8 @@ def send_market_order(
 
 
 def sync_broker_orders(conn: psycopg.Connection) -> None:
+
+
     """
     Synchronize all broker-managed trades with the signals table.
 
@@ -254,6 +260,12 @@ def sync_broker_orders(conn: psycopg.Connection) -> None:
       - Send one "BROKER CLOSE" telegram when a trade transitions to closed.
     """
     client = get_broker_client()
+    
+    # calling this function to have balance, margine available updated in public module
+    client.update_account_summary()
+    logger.info(f"From order sync - Balance: {public_module.balance}")
+    logger.info(f"From order sync - Available margin: {public_module.margin_available}")
+
     env = client.config.env  # 'demo' or 'live'
 
     logger.info("[OrderSync] Starting broker sync for env=%s", env)
@@ -496,18 +508,18 @@ def sync_broker_orders(conn: psycopg.Connection) -> None:
                     f"Trade ID:     {trade_id}",
                     "",
                     f"Entry price:  {truncate(actual_entry_price,5)}",
-                    f"Exit price:   {truncate(actual_exit_price,5)}",
+                    f"Exit price:     {truncate(actual_exit_price,5)}",
                 ]
 
                 if profit_pips is not None:
-                    msg_lines.append(f"Pips:         {truncate(profit_pips,2)}")
+                    msg_lines.append(f"Pips:          {truncate(profit_pips,2)}")
                 if profit_ccy is not None:
                     msg_lines.append(f"Profit:       ${truncate(profit_ccy,2)}")
 
                 msg_lines.append("")
                 msg_lines.append(f"Event time:   {event_time}")
                 if actual_exit_time is not None:
-                    msg_lines.append(f"Close time:   {actual_exit_time}")
+                    msg_lines.append(f"Close time:   {actual_exit_time.replace(second=1,microsecond=0)}")
 
                 notify_telegram("\n".join(msg_lines), ChatType.INFO)
             except Exception as e:

@@ -7,8 +7,14 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Dict, Optional
 import os
+import public_module
 
 import requests
+import logging
+
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -144,6 +150,34 @@ class BrokerClient:
         """
         path = f"/accounts/{self.config.account_id}/summary"
         return self._get(path)
+
+    # -------- NEW: convenience helper for balance + available margin --------
+    def update_account_summary(self):
+        """
+        Convenience helper to return current balance and available margin
+        as Decimals.
+
+        Returns
+        -------
+        Dict[str, Decimal]
+            {
+                "balance": Decimal(...),
+                "margin_available": Decimal(...)
+            }
+        """
+        logger.info("Getting account summary from broker...")
+
+        data = self.get_account_summary()
+        account = data.get("account", {})
+
+        try:
+            balance = Decimal(account["balance"])
+            margin_available = Decimal(account["marginAvailable"])
+            public_module.balance = balance
+            public_module.margin_available = margin_available
+            
+        except KeyError as exc:
+            raise RuntimeError(f"Missing expected key in OANDA account summary: {exc}") from exc
 
     def get_trade(self, trade_id: str) -> Dict[str, Any]:
         """
