@@ -46,6 +46,11 @@ NEWS_BLOCK_WINDOW_MIN = int(config_data.get("NEWS_BLOCK_WINDOW_MIN", 30)[0])
 # All signals are emitted and logged. Final "send or not send" filter
 # is applied before order sending (MIN_PIPS_FOR_ORDER) AFTER TP_ADJUST_FACTOR.
 
+import math
+
+def truncate(value: float, decimals: int) -> float:
+    factor = 10 ** decimals
+    return math.trunc(value * factor) / factor
 
 # --------------------------------------------------------------------
 # News filter
@@ -385,7 +390,7 @@ def run_decision_event(
                             f"(exchange={exchange}, tf={timeframe}, side={side}, source={price_source})"
                         )
                         continue
-
+                    
                     # Normalize pivot time to minute for dedup keys (and DB found_at)
                     found_at_minute = tgt_pivot_time.replace(second=0, microsecond=0)
 
@@ -458,8 +463,14 @@ def run_decision_event(
                     # 7) Decide whether to send order to broker
                     #    (adjusted pips + news filter)
                     # ------------------------------------------------
-                    send_to_broker = target_pips > spread * 2
+                    send_to_broker = target_pips > spread
                     send_to_broker_for_notif = send_to_broker
+        
+                    # price_source == "candle_close" usually means we are at some points like market close or some specific situation that we are not receiving tick data
+                    # which means there is no reliable data, so we do not send any order to Broker
+                    if price_source == "candle_close":
+                        send_to_broker = False
+                        send_to_broker_for_notif = False
 
                     # News blocking: check BOTH base and quote currencies
                     blocked_flag = False
@@ -485,8 +496,9 @@ def run_decision_event(
                     print(
                         "[SIGNAL] "
                         f"event_time={event_time} | target={tgt} | side={side} | "
-                        f"position_price={position_price} | target_price={target_price} | "
-                        f"target_pips={target_pips:.1f} (raw={target_pips_raw}) | "
+                        f"position_price={truncate(position_price,5)} | target_price={truncate(target_price,5)} | "
+                        f"target_pips={truncate(target_pips,2)} (raw={truncate(target_pips_raw,2)}) | "
+                        f"spread={truncate(spread,1)} | "
                         f"confirm_symbols=[{confirm_syms_str}] | "
                         f"ref={ref_symbol} {ref_type} @ {pivot_time} | "
                         f"pivot_time(target)={tgt_pivot_time} | "
@@ -509,10 +521,11 @@ def run_decision_event(
                                 f"Symbol:         {tgt}\n"
                                 f"Side:           {side_upper}\n"
                                 f"Price source:   {price_source}\n\n"
-                                f"Entry price:    {position_price}\n"
-                                f"Target price:   {target_price}\n"
-                                f"Distance:       {target_pips:.1f} pips\n"
-                                f"Est. Profit:    ${profit_est}\n\n"
+                                f"Entry price:    {truncate(position_price,5)}\n"
+                                f"Target price:   {truncate(target_price,5)}\n"
+                                f"Distance:       {truncate(target_pips,2)} pips\n"
+                                f"Spread:         {truncate(spread,2)}\n"
+                                f"Est. Profit:    ${truncate(profit_est,2)}\n\n"
                                 f"Ref pivot:      {ref_symbol}  ({ref_type})\n"
                                 f"Ref pivot time: {pivot_time.strftime('%Y-%m-%d %H:%M')}\n\n"
                                 f"Target pivot time: {tgt_pivot_time.strftime('%Y-%m-%d %H:%M')}\n"
@@ -536,10 +549,11 @@ def run_decision_event(
                                 f"Symbol:         {tgt}\n"
                                 f"Side:           {side_upper}\n"
                                 f"Price source:   {price_source}\n\n"
-                                f"Entry price:    {position_price}\n"
-                                f"Target price:   {target_price}\n"
-                                f"Distance:       {target_pips:.1f} pips\n"
-                                f"Est. Profit:    ${profit_est}\n\n"
+                                f"Entry price:    {truncate(position_price,5)}\n"
+                                f"Target price:   {truncate(target_price,5)}\n"
+                                f"Distance:       {truncate(target_pips,2)} pips\n"
+                                f"Spread:         {truncate(spread,1)}\n"
+                                f"Est. Profit:    ${truncate(profit_est,2)}\n\n"
                                 f"Ref pivot:      {ref_symbol}  ({ref_type})\n"
                                 f"Ref pivot time: {pivot_time.strftime('%Y-%m-%d %H:%M')}\n\n"
                                 f"Target pivot time: {tgt_pivot_time.strftime('%Y-%m-%d %H:%M')}\n"
@@ -610,14 +624,15 @@ def run_decision_event(
                                         f"Symbol:         {tgt}\n"
                                         f"Side:           {side_upper}\n"
                                         f"Price source:   {price_source}\n\n"
-                                        f"Entry price:    {position_price}\n"
-                                        f"Target price:   {target_price}\n"
-                                        f"Distance:       {target_pips} pips\n"
-                                        f"Est. Profit:    ${profit_est}\n\n"
+                                        f"Entry price:    {truncate(position_price,5)}\n"
+                                        f"Target price:   {truncate(target_price,5)}\n"
+                                        f"Distance:       {truncate(target_pips,2)} pips\n"
+                                        f"Spread:         {truncate(spread,1)}\n"
+                                        f"Est. Profit:    ${truncate(profit_est,2)}\n\n"
                                         f"Ref pivot:      {ref_symbol}  ({ref_type})\n"
-                                        f"Ref pivot time: {pivot_time.strftime('%Y-%m-%d %H:%M')}\n\n"
+                                        f"Ref pivot time:    {pivot_time.strftime('%Y-%m-%d %H:%M')}\n\n"
                                         f"Target pivot time: {tgt_pivot_time.strftime('%Y-%m-%d %H:%M')}\n"
-                                        f"Event time:        {event_time.strftime('%Y-%m-%d %H:%M')}\n\n"
+                                        f"Event time:           {event_time.strftime('%Y-%m-%d %H:%M')}\n\n"
                                         f"Confirm symbols: {confirm_syms_str}"
                                     )
                                     notify_telegram(msg, ChatType.INFO)
@@ -862,7 +877,7 @@ def _insert_signals(conn: psycopg.Connection, rows: List[tuple]) -> None:
             ref_type,
             pivot_time,
             found_at,
-            blocked_by_news
+            blocked_by_news,
         ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """
     with conn.cursor() as cur:

@@ -16,6 +16,12 @@ import psycopg
 from .broker_oanda import BrokerClient, create_client_from_env
 from telegram_notifier import notify_telegram, ChatType
 
+import math
+
+def truncate(value: float, decimals: int) -> float:
+    factor = 10 ** decimals
+    return math.trunc(value * factor) / factor
+
 logger = logging.getLogger(__name__)
 
 # Load env variables from src/data/.env (for local/dev runs)
@@ -483,20 +489,20 @@ def sync_broker_orders(conn: psycopg.Connection) -> None:
                 msg_lines: List[str] = [
                     "✅ BROKER CLOSE",
                     f"Symbol:       {symbol_str}",
-                    f"Side:         {side.upper()}",
-                    f"Units:        {order_units}",
+                    f"Side:           {side.upper()}",
+                    f"Units:          {order_units}",
                     "",
                     f"Order ID:     {broker_order_id}",
                     f"Trade ID:     {trade_id}",
                     "",
-                    f"Entry price:  {actual_entry_price}",
-                    f"Exit price:   {actual_exit_price}",
+                    f"Entry price:  {truncate(actual_entry_price,5)}",
+                    f"Exit price:   {truncate(actual_exit_price,5)}",
                 ]
 
                 if profit_pips is not None:
-                    msg_lines.append(f"Pips:         {profit_pips:.1f}")
+                    msg_lines.append(f"Pips:         {truncate(profit_pips,2)}")
                 if profit_ccy is not None:
-                    msg_lines.append(f"Profit:       {profit_ccy}")
+                    msg_lines.append(f"Profit:       ${truncate(profit_ccy,2)}")
 
                 msg_lines.append("")
                 msg_lines.append(f"Event time:   {event_time}")
