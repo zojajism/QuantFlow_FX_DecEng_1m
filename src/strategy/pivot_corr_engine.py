@@ -512,9 +512,13 @@ def run_decision_event(
                     if send_to_broker:
                         try:
                             if tgt == "USD/JPY":
-                                profit_est = (DEFAULT_ORDER_UNITS * target_pips / 100)
+                                # first compute profit in JPY, then convert to USD
+                                profit_jpy = (DEFAULT_ORDER_UNITS * target_pips / 100)  # pip size = 0.01 → /100
+                                profit_est = profit_jpy / float(position_price)         # JPY → USD
                             else:
+                                # for XXX/USD majors, this is already in USD
                                 profit_est = (DEFAULT_ORDER_UNITS * target_pips / 10000)
+
 
                             msg = (
                                 "⚡ Pivot Correlation Signal\n"
@@ -728,6 +732,7 @@ def run_decision_event(
                             pivot_time,             # pivot_time (ref anchor)
                             found_at_minute,        # found_at (target pivot time)
                             blocked_flag,           # blocked_by_news
+                            spread,                 # spread
                         ))
 
     # ----------------------------------------------------------------
@@ -878,11 +883,16 @@ def _insert_signals(conn: psycopg.Connection, rows: List[tuple]) -> None:
             pivot_time,
             found_at,
             blocked_by_news,
-        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            spread
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """
-    with conn.cursor() as cur:
-        cur.executemany(sql, rows)
-    conn.commit()
+    try:
+        with conn.cursor() as cur:
+            cur.executemany(sql, rows)
+        conn.commit()
+    except Exception as e:
+        print("[DB ERROR] insert signals failed:", e)
+
 
 
 def _update_signals_with_orders(
