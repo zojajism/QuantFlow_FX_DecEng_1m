@@ -69,6 +69,7 @@ def compute_pivots(
             open_time=p.get("open_time"),
             price=p["high"],
             is_hit=bool(p.get("hit", False)),
+            hit_distance=p.get("hit_distance"),   # <<< NEW
         )
         for p in peaks_raw
     ]
@@ -79,8 +80,23 @@ def compute_pivots(
             open_time=q.get("open_time"),
             price=q["low"],
             is_hit=bool(q.get("hit", False)),
+            hit_distance=q.get("hit_distance"),   # <<< NEW            
         )
         for q in lows_raw
     ]
 
+    '''
+    print("\nPeaks:")
+    for p in peaks:
+        print(
+            f"  time={p.time}  price={p.price}  hit={p.is_hit}  hit_distance={p.hit_distance}"
+        )
+
+    print("\nLows:")
+    for q in lows:
+        print(
+            f"  time={q.time}  price={q.price}  hit={q.is_hit}  hit_distance={q.hit_distance}"
+        )
+     '''      
+    
     return peaks, lows

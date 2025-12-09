@@ -243,6 +243,7 @@ def run_decision_event(
                 pivot_time = rp["time"]           # datetime of pivot (close time)
                 ref_price = rp["price"]           # float pivot price
                 ref_hit = bool(rp["hit"])         # pivot already hit or not
+                ref_hit_distance = rp.get("hit_distance")
 
                 # SAME-type peers (peaks or lows depending on ref_type)
                 rows_same, _ = _compare_ref_with_peers(
@@ -285,6 +286,8 @@ def run_decision_event(
                         bool(rec["hit"]),
                         delta_minute,
                         found_at,
+                        rec["hit_distance"],
+                        ref_hit_distance,
                     ))
 
                 for rec in rows_opp:
@@ -302,6 +305,8 @@ def run_decision_event(
                         bool(rec["hit"]),
                         delta_minute,
                         found_at,
+                        rec["hit_distance"],
+                        ref_hit_distance,
                     ))
 
                 # ----------------------------------------------------
@@ -523,13 +528,10 @@ def run_decision_event(
                     if send_to_broker:
                         try:
                             if tgt == "USD/JPY":
-                                # first compute profit in JPY, then convert to USD
-                                profit_jpy = (DEFAULT_ORDER_UNITS * target_pips / 100)  # pip size = 0.01 → /100
-                                profit_est = profit_jpy / float(position_price)         # JPY → USD
+                                profit_jpy = (Decimal(DEFAULT_ORDER_UNITS) * target_pips) / Decimal("100")
+                                profit_est = profit_jpy / position_price
                             else:
-                                # for XXX/USD majors, this is already in USD
-                                profit_est = (DEFAULT_ORDER_UNITS * target_pips / 10000)
-
+                                profit_est = (Decimal(DEFAULT_ORDER_UNITS) * target_pips) / Decimal("10000")
 
                             msg = (
                                 "⚡ Pivot Correlation Signal\n"
@@ -829,6 +831,7 @@ def _compare_ref_with_peers(
                 "hit": False,
                 "delta_min": None,
                 "price": None,
+                "hit_distance": None,
             })
             continue
 
@@ -849,6 +852,8 @@ def _compare_ref_with_peers(
             "hit": m_hit,
             "delta_min": delta_m_abs,
             "price": m_price,
+            "hit_distance": mp.get("hit_distance"),   # <<< REQUIRED
+
         })
 
     return comparisons, {"hit": hit_counter}
@@ -903,12 +908,17 @@ def _insert_pivot_loop_log(conn: psycopg.Connection, rows: List[tuple]) -> None:
             is_found,
             is_hit,
             delta_minute,
-            found_at
-        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            found_at,
+            hit_distance,
+            ref_hit_distance
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """
-    with conn.cursor() as cur:
-        cur.executemany(sql, rows)
-    conn.commit()
+    try:
+        with conn.cursor() as cur:
+            cur.executemany(sql, rows)
+        conn.commit()
+    except Exception as e:
+        print("[DB ERROR] insert pivot_loop_log failed:", e)
 
 
 def _insert_signals(conn: psycopg.Connection, rows: List[tuple]) -> None:
@@ -1015,6 +1025,7 @@ def _collect_pivots_from_registry(
             "open_time": open_time_t,
             "price": price_v,
             "hit": bool(hit_v),
+            "hit_distance": getattr(p, "hit_distance", None),   # <<< REQUIRED
             "type": pivot_type.upper(),
         })
 

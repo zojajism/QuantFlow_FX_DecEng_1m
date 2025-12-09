@@ -102,6 +102,7 @@ def _gather_pivot_list_rows(
                     pivot_open_time,       # pivot_open_time (if available)
                     price,                 # price
                     hit,                   # hit
+                    getattr(p, "hit_distance", None), #hit_distance
                 ))
         except Exception:
             pass
@@ -124,6 +125,7 @@ def _gather_pivot_list_rows(
                     pivot_open_time,
                     price,
                     hit,
+                    getattr(p, "hit_distance", None), #hit_distance
                 ))
         except Exception:
             pass
@@ -144,8 +146,8 @@ def _async_insert_pivot_list(rows: List[tuple]) -> None:
             conn = get_pg_conn()
             sql = """
                 INSERT INTO pivot_list (
-                    event_time, symbol, pivot_type, pivot_time, pivot_open_time, price, hit
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s)
+                    event_time, symbol, pivot_type, pivot_time, pivot_open_time, price, hit, hit_distance
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
             """
             with conn.cursor() as cur:
                 cur.executemany(sql, batch)

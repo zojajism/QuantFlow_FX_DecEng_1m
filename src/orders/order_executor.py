@@ -519,7 +519,7 @@ def sync_broker_orders(conn: psycopg.Connection) -> None:
                 msg_lines.append("")
                 msg_lines.append(f"Event time:   {event_time}")
                 if actual_exit_time is not None:
-                    msg_lines.append(f"Close time:   {actual_exit_time.replace(second=1,microsecond=0)}")
+                    msg_lines.append(f"Close time:    {actual_exit_time.replace(second=0,microsecond=0)}")
 
                 notify_telegram("\n".join(msg_lines), ChatType.INFO)
             except Exception as e:

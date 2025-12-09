@@ -9,6 +9,7 @@ class Pivot:
     open_time: Any     # candle open time (optional)
     price: float       # high for peaks, low for lows
     is_hit: bool = False
+    hit_distance: Optional[int] = None     # <<< ADDED FIELD
 
 class PivotBuffer:
     """
