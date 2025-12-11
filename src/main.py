@@ -17,14 +17,12 @@ import yaml
 from pathlib import Path
 from entry import on_candle_closed, init_entry
 from buffers.tick_registry_provider import get_tick_registry
-
 from signals.open_signal_registry import get_open_signal_registry
-
 from database.db_general import get_pg_conn
-
 from public_module import config_data
-
 from orders.order_executor import update_account_summary
+from strategy.fx_correlation import refresh_correlation_cache
+
 
 Candle_SUBJECT = "candles.>"   
 Candle_STREAM = "STREAM_CANDLES"   
@@ -61,6 +59,8 @@ async def main():
                         })
                 )
         notify_telegram(f"❇️ QuantFlow_Fx_DecEng_1m started....", ChatType.ALERT)
+        
+        refresh_correlation_cache()
         
         update_account_summary()
 

@@ -35,6 +35,7 @@ from public_module import config_data, check_available_required_margine
 
 from orders.broker_oanda import create_client_from_env
 
+from strategy.fx_correlation import is_signal_confirmed_by_correlation
 import math
 
 MAX_TICK_AGE_SEC = 10  # if last tick older than this (in seconds), fallback to candle close
@@ -325,7 +326,7 @@ def run_decision_event(
 
                 total_hits = sum(1 for v in hit_map.values() if v)
                 confirm_syms_str = ", ".join([s for s, v in hit_map.items() if v])
-
+                
                 # Rule: we require at least 3 hits across the basket.
                 if total_hits < 3:
                     continue
@@ -430,7 +431,7 @@ def run_decision_event(
                     # Always use absolute distance as "magnitude"
                     target_pips_abs = abs(target_pips_raw)
 
-                    # Apply 0.8 rule immediately; from now this is THE TP distance
+                    # Apply 0.9 rule immediately; from now this is THE TP distance
                     target_pips = target_pips_abs * TP_ADJUST_FACTOR
 
                     # Directional pips for price computation
@@ -477,15 +478,26 @@ def run_decision_event(
                     send_to_broker_for_notif = send_to_broker
                     send_to_broker_for_margine_check = send_to_broker
 
-                    margine_ok, mergine_required = check_available_required_margine(tgt, DEFAULT_ORDER_UNITS)
-                    send_to_broker = margine_ok
 
+                    margine_ok, mergine_required = check_available_required_margine(tgt, DEFAULT_ORDER_UNITS)
+                    #send_to_broker = margine_ok
                     print(f"margine_ok: {margine_ok}, margine_req:{mergine_required}")
+
+
                     # price_source == "candle_close" usually means we are at some points like market close or some specific situation that we are not receiving tick data
                     # which means there is no reliable data, so we do not send any order to Broker
                     if price_source == "candle_close":
                         send_to_broker = False
                         send_to_broker_for_notif = False
+
+                    print(hit_map.items())
+                    confirming_symbols = [sym for sym, ok in hit_map.items() if ok]
+                    send_to_broker = is_signal_confirmed_by_correlation(
+                                                            signal_symbol = tgt,
+                                                            confirming_symbols = confirming_symbols,
+                                                            threshold = public_module.CORRELATION_SCORE,
+                                                        )
+                    send_to_broker_for_correlation = send_to_broker
 
                     # News blocking: check BOTH base and quote currencies
                     blocked_flag = False
@@ -554,6 +566,34 @@ def run_decision_event(
                         except Exception as e:
                             print(f"[WARN] telegram notify failed: {e}")
 
+                    if not send_to_broker_for_correlation:
+                        try:
+                            if tgt == "USD/JPY":
+                                profit_est = (DEFAULT_ORDER_UNITS * target_pips / 100)
+                            else:
+                                profit_est = (DEFAULT_ORDER_UNITS * target_pips / 10000)
+
+                            msg = (
+                                "🔲 Pivot Correlation Signal\n"
+                                f"*** blocked_by_correlation ***\n"
+                                f"Symbol:         {tgt}\n"
+                                f"Side:           {side_upper}\n"
+                                f"Price source:   {price_source}\n\n"
+                                f"Entry price:    {truncate(position_price,5)}\n"
+                                f"Target price:   {truncate(target_price,5)}\n"
+                                f"Distance:       {truncate(target_pips,2)} pips\n"
+                                f"Spread:         {truncate(spread,1)}\n"
+                                f"Est. Profit:    ${truncate(profit_est,2)}\n\n"
+                                f"Ref pivot:      {ref_symbol}  ({ref_type})\n"
+                                f"Ref pivot time: {pivot_time.strftime('%Y-%m-%d %H:%M')}\n\n"
+                                f"Target pivot time: {tgt_pivot_time.strftime('%Y-%m-%d %H:%M')}\n"
+                                f"Event time:        {event_time.strftime('%Y-%m-%d %H:%M')}\n\n"
+                                f"Confirm symbols: {confirm_syms_str}"
+                            )
+                            notify_telegram(msg, ChatType.INFO)
+                        except Exception as e:
+                            print(f"[WARN] telegram notify failed: {e}")
+
                     if send_to_broker_for_notif and blocked_flag:
                         try:
                             if tgt == "USD/JPY":
@@ -582,7 +622,6 @@ def run_decision_event(
                         except Exception as e:
                             print(f"[WARN] telegram notify failed: {e}")
 
-                   
                     if send_to_broker_for_margine_check and not margine_ok:
                         try:
                             if tgt == "USD/JPY":

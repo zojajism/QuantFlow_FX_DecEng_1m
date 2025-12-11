@@ -1,11 +1,25 @@
 from pathlib import Path
-
 import yaml
-
+from typing import Dict, Tuple, Optional
+from datetime import datetime
 
 margin_available = 0.0
 balance = 0.0
 margin_dict = {}
+
+CORRELATION_SCORE=60.0
+
+# Type:
+#   correlation_cache[timeframe][(sym_a, sym_b)] = corr_value
+# where (sym_a, sym_b) is an unordered / canonical pair (sorted tuple).
+correlation_cache: Dict[str, Dict[Tuple[str, str], float]] = {
+    "5m": {},
+    "15m": {},
+}
+
+# Last as_of_time loaded into the cache (for monitoring / debugging)
+correlation_as_of_time: Optional[datetime] = None
+
 
 CONFIG_PATH = Path("/data/config.yaml")
 if not CONFIG_PATH.exists():
@@ -16,6 +30,9 @@ if not CONFIG_PATH.exists():
 
 with CONFIG_PATH.open("r", encoding="utf-8") as f:
     config_data = yaml.safe_load(f) or {}
+
+
+CORRELATION_SCORE = config_data.get("CORRELATION_SCORE", 60.0)
 
 
 # preparing the margine list

@@ -20,6 +20,8 @@ from orders.order_executor import sync_broker_orders
 
 from public_module import config_data
 
+from strategy.fx_correlation import refresh_correlation_cache
+
 symbols = [str(s) for s in config_data.get("symbols", [])]
 timeframes = [str(t) for t in config_data.get("timeframes", [])]
 
@@ -244,6 +246,9 @@ def on_candle_closed(exchange: str, symbol: str, timeframe: str, close_time: Any
         #   - detect closed trades and fill actual_exit_*, profit_pips, profit_ccy
         #   - send Telegram for broker-closed trades
         sync_broker_orders(conn)
+
+
+        refresh_correlation_cache()
 
     finally:
         try:
