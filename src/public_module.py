@@ -1,13 +1,20 @@
+
+from __future__ import annotations
+
 from pathlib import Path
 import yaml
 from typing import Dict, Tuple, Optional
-from datetime import datetime
+from datetime import datetime, time, timezone
+
+from zoneinfo import ZoneInfo
 
 margin_available = 0.0
 balance = 0.0
 margin_dict = {}
 
 CORRELATION_SCORE=60.0
+
+MAX_HIT_DISTANCE_DEVIATION=5
 
 # Type:
 #   correlation_cache[timeframe][(sym_a, sym_b)] = corr_value
@@ -33,6 +40,7 @@ with CONFIG_PATH.open("r", encoding="utf-8") as f:
 
 
 CORRELATION_SCORE = config_data.get("CORRELATION_SCORE", 60.0)
+MAX_HIT_DISTANCE_DEVIATION = config_data.get("MAX_HIT_DISTANCE_DEVIATION", 5)
 
 
 # preparing the margine list
@@ -67,3 +75,46 @@ def check_available_required_margine(symbol: str, trade_unit: int) -> tuple[bool
     required_margine = round(trade_unit / float(margine),3)
 
     return round(margin_available,3) > required_margine, required_margine
+
+
+
+def allow_trade_session_utc(dt_utc: datetime) -> bool:
+    """
+    Allow trades only during:
+      - London: 08:00–17:00 Europe/London
+      - New York: 08:00–17:00 America/New_York
+
+    Friday rule:
+      - Only London session is allowed (NY is NOT allowed on Fridays)
+
+    Weekends:
+      - Always False
+
+    Input:
+      - dt_utc can be naive (assumed UTC) or tz-aware.
+    """
+    # Normalize to aware UTC
+    if dt_utc.tzinfo is None:
+        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+    else:
+        dt_utc = dt_utc.astimezone(timezone.utc)
+
+    # Weekend: no trading
+    if dt_utc.weekday() >= 5:  # Sat(5), Sun(6)
+        return False
+
+    london = dt_utc.astimezone(ZoneInfo("Europe/London"))
+    ny = dt_utc.astimezone(ZoneInfo("America/New_York"))
+
+    def in_window(local_dt: datetime, start: time, end: time) -> bool:
+        t = local_dt.time()
+        return start <= t < end
+
+    in_london = in_window(london, time(8, 0), time(17, 0))
+    in_ny = in_window(ny, time(8, 0), time(17, 0))
+
+    # Friday: stop after London close (ignore NY entirely)
+    if london.weekday() == 4:  # Friday
+        return in_london
+
+    return in_london or in_ny

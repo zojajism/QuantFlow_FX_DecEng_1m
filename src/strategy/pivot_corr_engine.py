@@ -2,6 +2,7 @@
 # English-only comments
 
 from __future__ import annotations
+import logging
 
 import public_module
 
@@ -52,6 +53,8 @@ NEWS_BLOCK_WINDOW_MIN = int(config_data.get("NEWS_BLOCK_WINDOW_MIN", 30)[0])
 # NOTE: We DO NOT apply any min-pip filter to signal generation itself.
 # All signals are emitted and logged. Final "send or not send" filter
 # is applied before order sending (MIN_PIPS_FOR_ORDER) AFTER TP_ADJUST_FACTOR.
+
+logger = logging.getLogger(__name__)
 
 
 def truncate(value: float, decimals: int) -> float:
@@ -474,10 +477,52 @@ def run_decision_event(
                     # 7) Decide whether to send order to broker
                     #    (adjusted pips + news filter)
                     # ------------------------------------------------
-                    send_to_broker = target_pips > spread
-                    send_to_broker_for_notif = send_to_broker
-                    send_to_broker_for_margine_check = send_to_broker
+                    reject_reason = ''
+                    reject_by_pips = False
+                    reject_by_price_source = False
+                    reject_by_news = False
+                    reject_by_correlation = False
+                    reject_by_hit_timing = False
+                    reject_by_market_time = False
 
+                    #*****************************************************************************************************************************
+                    # NEW: Deviation of hit_distance across CONFIRMING symbols
+                    # (includes ref_hit_distance if ref is confirming and has a distance)
+                    # ----------------------------------------------------
+                    confirm_hit_distances: List[Decimal] = []
+
+                    # 1) ref symbol distance (only if it is a confirmer + distance exists)
+                    if hit_map.get(ref_symbol) and ref_hit_distance is not None:
+                        confirm_hit_distances.append(Decimal(str(ref_hit_distance)))
+
+                    # 2) peer symbols distances (only for confirmers + distance exists)
+                    for sym, is_confirm in hit_map.items():
+                        if not is_confirm or sym == ref_symbol:
+                            continue
+                        c = comp_by_symbol.get(sym)
+                        if not c:
+                            continue
+                        hd = c.get("hit_distance")
+                        if hd is None:
+                            continue
+                        confirm_hit_distances.append(Decimal(str(hd)))
+
+                    print(confirm_hit_distances)
+                    # deviation = max - min (only meaningful when we have 2+ distances)
+                    hit_distance_deviation: Optional[Decimal] = None
+                    if len(confirm_hit_distances) >= 2:
+                        hit_distance_deviation = max(confirm_hit_distances) - min(confirm_hit_distances)
+                    else:
+                        hit_distance_deviation = Decimal("0")
+
+                    if hit_distance_deviation is not None and hit_distance_deviation > public_module.MAX_HIT_DISTANCE_DEVIATION:
+                        reject_by_hit_timing = True
+                        reject_reason = reject_reason + 'hit_timing, '
+
+                    #*****************************************************************************************************************************
+                    reject_by_pips = target_pips <= spread
+                    if reject_by_pips:
+                        reject_reason = reject_reason + 'pips,'
 
                     margine_ok, mergine_required = check_available_required_margine(tgt, DEFAULT_ORDER_UNITS)
                     #send_to_broker = margine_ok
@@ -487,35 +532,46 @@ def run_decision_event(
                     # price_source == "candle_close" usually means we are at some points like market close or some specific situation that we are not receiving tick data
                     # which means there is no reliable data, so we do not send any order to Broker
                     if price_source == "candle_close":
-                        send_to_broker = False
-                        send_to_broker_for_notif = False
+                        reject_reason = reject_reason + 'candle_close, '
+                        reject_by_price_source = True
+
 
                     print(hit_map.items())
                     confirming_symbols = [sym for sym, ok in hit_map.items() if ok]
-                    send_to_broker = is_signal_confirmed_by_correlation(
+                    reject_by_correlation = not is_signal_confirmed_by_correlation(
                                                             signal_symbol = tgt,
                                                             confirming_symbols = confirming_symbols,
                                                             threshold = public_module.CORRELATION_SCORE,
                                                         )
-                    send_to_broker_for_correlation = send_to_broker
+                    if reject_by_correlation:
+                        reject_reason = reject_reason + 'correlation, '
 
                     # News blocking: check BOTH base and quote currencies
-                    blocked_flag = False
-                    if send_to_broker:
-                        parts = tgt.upper().split("/")
-                        currs: List[str] = []
-                        if len(parts) == 1:
-                            currs = [parts[0]]
-                        else:
-                            currs = [parts[0], parts[1]]
+                    parts = tgt.upper().split("/")
+                    currs: List[str] = []
+                    if len(parts) == 1:
+                        currs = [parts[0]]
+                    else:
+                        currs = [parts[0], parts[1]]
 
-                        for ccy in currs:
-                            if blocked_by_news(conn, ccy):
-                                blocked_flag = True
-                                break
+                    for ccy in currs:
+                        if blocked_by_news(conn, ccy):
+                            reject_by_news = True
+                            reject_reason = reject_reason + 'news, '
+                            break
 
-                        if blocked_flag:
-                            send_to_broker = False
+                    if not public_module.allow_trade_session_utc(event_time):
+                        reject_by_market_time = True
+                        reject_reason = reject_reason + 'market_time, '
+
+                    #checking the rejecting reasons
+                    if reject_by_market_time == True or reject_by_correlation == True or reject_by_news == True or reject_by_pips == True or reject_by_price_source == True or reject_by_hit_timing == True:
+                        send_to_broker = False
+                        logger.info(f"Signal is blocked: {reject_reason}")
+                    else:
+                        send_to_broker = True
+
+                    #===========================================================================================================================================
 
                     order_info: Optional[OrderExecutionResult] = None
 
@@ -532,41 +588,11 @@ def run_decision_event(
                         f"pivot_time(target)={tgt_pivot_time} | "
                         f"pivot_type(target)={tgt_pivot_type} | "
                         f"price_source={price_source} | "
-                        f"blocked_by_news={blocked_flag} | "
+                        f"blocked_reason={reject_reason} | "
                         f"send_to_broker={send_to_broker}"
                     )
 
-                    # Telegram notification ONLY for broker-eligible & not-blocked signals
-                    if send_to_broker:
-                        try:
-                            if tgt == "USD/JPY":
-                                profit_jpy = (Decimal(DEFAULT_ORDER_UNITS) * target_pips) / Decimal("100")
-                                profit_est = profit_jpy / position_price
-                            else:
-                                profit_est = (Decimal(DEFAULT_ORDER_UNITS) * target_pips) / Decimal("10000")
-
-                            msg = (
-                                "⚡ Pivot Correlation Signal\n"
-                                f"Symbol:         {tgt}\n"
-                                f"Side:           {side_upper}\n"
-                                f"Price source:   {price_source}\n\n"
-                                f"Entry price:    {truncate(position_price,5)}\n"
-                                f"Target price:   {truncate(target_price,5)}\n"
-                                f"Distance:       {truncate(target_pips,2)} pips\n"
-                                f"Spread:         {truncate(spread,2)}\n"
-                                f"mergine_required: ${mergine_required}\n"
-                                f"Est. Profit:    ${truncate(profit_est,2)}\n\n"
-                                f"Ref pivot:      {ref_symbol}  ({ref_type})\n"
-                                f"Ref pivot time: {pivot_time.strftime('%Y-%m-%d %H:%M')}\n\n"
-                                f"Target pivot time: {tgt_pivot_time.strftime('%Y-%m-%d %H:%M')}\n"
-                                f"Event time:        {event_time.strftime('%Y-%m-%d %H:%M')}\n\n"
-                                f"Confirm symbols: {confirm_syms_str}"
-                            )
-                            notify_telegram(msg, ChatType.INFO)
-                        except Exception as e:
-                            print(f"[WARN] telegram notify failed: {e}")
-
-                    if not send_to_broker_for_correlation:
+                    if not send_to_broker:
                         try:
                             if tgt == "USD/JPY":
                                 profit_est = (DEFAULT_ORDER_UNITS * target_pips / 100)
@@ -574,8 +600,8 @@ def run_decision_event(
                                 profit_est = (DEFAULT_ORDER_UNITS * target_pips / 10000)
 
                             msg = (
-                                "🔲 Pivot Correlation Signal\n"
-                                f"*** blocked_by_correlation ***\n"
+                                "🚫 Signal blocked\n\n"
+                                f"*** blocked_by: {reject_reason} ***\n\n"
                                 f"Symbol:         {tgt}\n"
                                 f"Side:           {side_upper}\n"
                                 f"Price source:   {price_source}\n\n"
@@ -585,67 +611,9 @@ def run_decision_event(
                                 f"Spread:         {truncate(spread,1)}\n"
                                 f"Est. Profit:    ${truncate(profit_est,2)}\n\n"
                                 f"Ref pivot:      {ref_symbol}  ({ref_type})\n"
-                                f"Ref pivot time: {pivot_time.strftime('%Y-%m-%d %H:%M')}\n\n"
-                                f"Target pivot time: {tgt_pivot_time.strftime('%Y-%m-%d %H:%M')}\n"
-                                f"Event time:        {event_time.strftime('%Y-%m-%d %H:%M')}\n\n"
-                                f"Confirm symbols: {confirm_syms_str}"
-                            )
-                            notify_telegram(msg, ChatType.INFO)
-                        except Exception as e:
-                            print(f"[WARN] telegram notify failed: {e}")
-
-                    if send_to_broker_for_notif and blocked_flag:
-                        try:
-                            if tgt == "USD/JPY":
-                                profit_est = (DEFAULT_ORDER_UNITS * target_pips / 100)
-                            else:
-                                profit_est = (DEFAULT_ORDER_UNITS * target_pips / 10000)
-
-                            msg = (
-                                "🔲 Pivot Correlation Signal\n"
-                                f"blocked_by_news={blocked_flag}\n"
-                                f"Symbol:         {tgt}\n"
-                                f"Side:           {side_upper}\n"
-                                f"Price source:   {price_source}\n\n"
-                                f"Entry price:    {truncate(position_price,5)}\n"
-                                f"Target price:   {truncate(target_price,5)}\n"
-                                f"Distance:       {truncate(target_pips,2)} pips\n"
-                                f"Spread:         {truncate(spread,1)}\n"
-                                f"Est. Profit:    ${truncate(profit_est,2)}\n\n"
-                                f"Ref pivot:      {ref_symbol}  ({ref_type})\n"
-                                f"Ref pivot time: {pivot_time.strftime('%Y-%m-%d %H:%M')}\n\n"
-                                f"Target pivot time: {tgt_pivot_time.strftime('%Y-%m-%d %H:%M')}\n"
-                                f"Event time:        {event_time.strftime('%Y-%m-%d %H:%M')}\n\n"
-                                f"Confirm symbols: {confirm_syms_str}"
-                            )
-                            notify_telegram(msg, ChatType.INFO)
-                        except Exception as e:
-                            print(f"[WARN] telegram notify failed: {e}")
-
-                    if send_to_broker_for_margine_check and not margine_ok:
-                        try:
-                            if tgt == "USD/JPY":
-                                profit_est = (DEFAULT_ORDER_UNITS * target_pips / 100)
-                            else:
-                                profit_est = (DEFAULT_ORDER_UNITS * target_pips / 10000)
-
-                            msg = (
-                                "Ⓜ️ Pivot Correlation Signal\n"
-                                f"blocked_by_margine={margine_ok}\n"
-                                f"Symbol:         {tgt}\n"
-                                f"Side:           {side_upper}\n"
-                                f"Price source:   {price_source}\n\n"
-                                f"Entry price:    {truncate(position_price,5)}\n"
-                                f"Target price:   {truncate(target_price,5)}\n"
-                                f"Distance:       {truncate(target_pips,2)} pips\n"
-                                f"Spread:         {truncate(spread,1)}\n"
-                                f"Est. Profit:    ${truncate(profit_est,2)}\n\n"
-                                f"mergine_required: ${mergine_required}\n"
-                                f"mergine_available: ${round(public_module.margin_available,3)}\n"
-                                f"Ref pivot:      {ref_symbol}  ({ref_type})\n"
-                                f"Ref pivot time: {pivot_time.strftime('%Y-%m-%d %H:%M')}\n\n"
-                                f"Target pivot time: {tgt_pivot_time.strftime('%Y-%m-%d %H:%M')}\n"
-                                f"Event time:        {event_time.strftime('%Y-%m-%d %H:%M')}\n\n"
+                                f"Ref pivot time:       {pivot_time.strftime('%Y-%m-%d %H:%M')}\n\n"
+                                f"Target pivot time:    {tgt_pivot_time.strftime('%Y-%m-%d %H:%M')}\n"
+                                f"Event time:           {event_time.strftime('%Y-%m-%d %H:%M')}\n\n"
                                 f"Confirm symbols: {confirm_syms_str}"
                             )
                             notify_telegram(msg, ChatType.INFO)
@@ -661,13 +629,7 @@ def run_decision_event(
                             )
                             order_units = DEFAULT_ORDER_UNITS
 
-                            print(
-                                "[ORDER] Sending market order:",
-                                f"instrument={instrument}",
-                                f"side={side}",
-                                f"units={order_units}",
-                                f"tp_price={target_price}",
-                            )
+                            logger.info(f"[ORDER] Sending market order: instrument={instrument}, side={side}, units={order_units}, tp_price={target_price}")
 
                             order_info = send_market_order(
                                 symbol=instrument,
@@ -772,6 +734,36 @@ def run_decision_event(
                         )
                     )
 
+                    # Telegram notification ONLY for broker-eligible & not-blocked signals
+                    if send_to_broker:
+                        try:
+                            if tgt == "USD/JPY":
+                                profit_jpy = (Decimal(DEFAULT_ORDER_UNITS) * target_pips) / Decimal("100")
+                                profit_est = profit_jpy / position_price
+                            else:
+                                profit_est = (Decimal(DEFAULT_ORDER_UNITS) * target_pips) / Decimal("10000")
+
+                            msg = (
+                                "⚡ Pivot Correlation Signal\n"
+                                f"Symbol:         {tgt}\n"
+                                f"Side:           {side_upper}\n"
+                                f"Price source:   {price_source}\n\n"
+                                f"Entry price:    {truncate(position_price,5)}\n"
+                                f"Target price:   {truncate(target_price,5)}\n"
+                                f"Distance:       {truncate(target_pips,2)} pips\n"
+                                f"Spread:         {truncate(spread,2)}\n"
+                                f"mergine_required: ${mergine_required}\n"
+                                f"Est. Profit:    ${truncate(profit_est,2)}\n\n"
+                                f"Ref pivot:      {ref_symbol}  ({ref_type})\n"
+                                f"Ref pivot time: {pivot_time.strftime('%Y-%m-%d %H:%M')}\n\n"
+                                f"Target pivot time: {tgt_pivot_time.strftime('%Y-%m-%d %H:%M')}\n"
+                                f"Event time:        {event_time.strftime('%Y-%m-%d %H:%M')}\n\n"
+                                f"Confirm symbols: {confirm_syms_str}"
+                            )
+                            notify_telegram(msg, ChatType.INFO)
+                        except Exception as e:
+                            print(f"[WARN] telegram notify failed: {e}")
+
                     # ------------------------------------------------
                     # 9) Queue DB updates for order-related columns
                     # ------------------------------------------------
@@ -819,7 +811,7 @@ def run_decision_event(
                             ref_type,               # ref_type (context)
                             pivot_time,             # pivot_time (ref anchor)
                             found_at_minute,        # found_at (target pivot time)
-                            blocked_flag,           # blocked_by_news
+                            reject_reason,          # reject_reason
                             spread,                 # spread
                         ))
 
@@ -978,7 +970,7 @@ def _insert_signals(conn: psycopg.Connection, rows: List[tuple]) -> None:
             ref_type,
             pivot_time,
             found_at,
-            blocked_by_news,
+            reject_reason,
             spread
         ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """

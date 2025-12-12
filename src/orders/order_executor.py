@@ -499,7 +499,7 @@ def sync_broker_orders(conn: psycopg.Connection) -> None:
         if final_status == "closed" and actual_exit_price is not None:
             try:
                 msg_lines: List[str] = [
-                    "✅ BROKER CLOSE",
+                    "🎯 BROKER CLOSE",
                     f"Symbol:       {symbol_str}",
                     f"Side:           {side.upper()}",
                     f"Units:          {order_units}",
@@ -517,9 +517,9 @@ def sync_broker_orders(conn: psycopg.Connection) -> None:
                     msg_lines.append(f"Profit:       ${truncate(profit_ccy,2)}")
 
                 msg_lines.append("")
-                msg_lines.append(f"Event time:   {event_time}")
+                msg_lines.append(f"Event time:    {event_time}")
                 if actual_exit_time is not None:
-                    msg_lines.append(f"Close time:    {actual_exit_time.replace(second=0,microsecond=0)}")
+                    msg_lines.append(f"Close time:    {actual_exit_time.strftime('%Y-%m-%d %H:%M')}")
 
                 notify_telegram("\n".join(msg_lines), ChatType.INFO)
             except Exception as e:
