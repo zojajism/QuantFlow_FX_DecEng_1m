@@ -66,7 +66,7 @@ def is_signal_confirmed_by_correlation(
       - Missing data in either timeframe => confirming symbol fails.
       - We require at least 3 confirming symbols that pass.
     """
-    #cache_5m = public_module.correlation_cache.get("5m", {})
+    cache_5m = public_module.correlation_cache.get("5m", {})
     cache_15m = public_module.correlation_cache.get("15m", {})
 
     good_count = 0
@@ -77,13 +77,12 @@ def is_signal_confirmed_by_correlation(
 
         # Canonical unordered pair key
         a, b = sorted((signal_symbol, confirm_sym))
-        #corr_5m = cache_5m.get((a, b))
+        corr_5m = cache_5m.get((a, b))
         corr_15m = cache_15m.get((a, b))
 
-        #if corr_5m is None or corr_15m is None:
-        logger.info(f"signal_symbol: {signal_symbol}, confirm_sym: {confirm_sym}, corr_15m: {corr_15m}")
+        logger.info(f"signal_symbol: {signal_symbol}, confirm_sym: {confirm_sym}, corr_5m: {corr_5m}, corr_15m: {corr_15m}")
 
-        if corr_15m is None:
+        if corr_5m is None:
             continue
 
         sign = expected_corr_sign(signal_symbol, confirm_sym)
@@ -92,9 +91,9 @@ def is_signal_confirmed_by_correlation(
             continue
 
         if sign > 0:
-            ok = (corr_15m >= threshold)
+            ok = (corr_5m >= threshold)
         else:
-            ok = (corr_15m <= -threshold)
+            ok = (corr_5m <= -threshold)
 
         if ok:
             good_count += 1
