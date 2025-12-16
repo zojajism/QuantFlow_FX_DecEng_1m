@@ -16,6 +16,14 @@ CORRELATION_SCORE=60.0
 
 MAX_HIT_DISTANCE_DEVIATION=5
 
+MIN_SL_PIPS= 8
+
+K_ATR= 1.2
+
+CORRELATION_CHECK= False
+
+FILTER_MARKET_TIME= True
+
 # Type:
 #   correlation_cache[timeframe][(sym_a, sym_b)] = corr_value
 # where (sym_a, sym_b) is an unordered / canonical pair (sorted tuple).
@@ -42,6 +50,12 @@ with CONFIG_PATH.open("r", encoding="utf-8") as f:
 CORRELATION_SCORE = config_data.get("CORRELATION_SCORE", 60.0)
 MAX_HIT_DISTANCE_DEVIATION = config_data.get("MAX_HIT_DISTANCE_DEVIATION", 5)
 
+MIN_SL_PIPS = config_data.get("MIN_SL_PIPS", 8)
+K_ATR = config_data.get("K_ATR", 1.2)
+
+CORRELATION_CHECK = config_data.get("CORRELATION_CHECK", False)
+
+FILTER_MARKET_TIME = config_data.get("FILTER_MARKET_TIME", True)
 
 # preparing the margine list
 # This section is a list of 1-key dictionaries → convert to normal dict
@@ -77,7 +91,7 @@ def check_available_required_margine(symbol: str, trade_unit: int) -> tuple[bool
     return round(margin_available,3) > required_margine, required_margine
 
 
-
+'''
 def allow_trade_session_utc(dt_utc: datetime) -> bool:
     """
     Allow trades only during:
@@ -118,3 +132,31 @@ def allow_trade_session_utc(dt_utc: datetime) -> bool:
         return in_london
 
     return in_london or in_ny
+'''
+
+def allow_trade_session_utc(dt_utc: datetime) -> bool:
+    """
+    Allow trades only during:
+      - London: 08:00–17:00 Europe/London
+
+    Weekends:
+      - Always False
+
+    Input:
+      - dt_utc can be naive (assumed UTC) or tz-aware.
+    """
+    # Normalize to aware UTC
+    if dt_utc.tzinfo is None:
+        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+    else:
+        dt_utc = dt_utc.astimezone(timezone.utc)
+
+    # Weekend: no trading
+    if dt_utc.weekday() >= 5:  # Sat(5), Sun(6)
+        return False
+
+    london = dt_utc.astimezone(ZoneInfo("Europe/London"))
+
+    # London trading window: 08:00–17:00 local London time
+    t = london.time()
+    return time(8, 0) <= t < time(17, 0)

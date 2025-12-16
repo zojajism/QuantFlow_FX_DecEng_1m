@@ -12,8 +12,6 @@ import public_module
 import requests
 import logging
 
-
-
 logger = logging.getLogger(__name__)
 
 
@@ -68,6 +66,19 @@ class BrokerClient:
         return resp.json()
 
     # ------------------------------------------------------------------
+    # Formatting helpers
+    # ------------------------------------------------------------------
+    def _fmt_price(self, instrument: str, price: Decimal) -> str:
+        """
+        OANDA expects instrument-specific precision.
+        Common: JPY pairs = 3 decimals, others = 5 decimals.
+        """
+        inst = instrument.upper()
+        if "JPY" in inst:
+            return f"{price:.3f}"
+        return f"{price:.5f}"
+
+    # ------------------------------------------------------------------
     # Public trading / account API
     # ------------------------------------------------------------------
     def create_market_order(
@@ -76,10 +87,11 @@ class BrokerClient:
         side: str,
         units: int,
         tp_price: Optional[Decimal] = None,
+        sl_price: Optional[Decimal] = None,
         client_order_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Create a MARKET order with optional Take Profit.
+        Create a MARKET order with optional Take Profit and Stop Loss.
 
         Parameters
         ----------
@@ -91,8 +103,9 @@ class BrokerClient:
             Positive for buy, negative for sell. If you pass positive, this
             method will set the sign based on 'side'.
         tp_price : Decimal, optional
-            Absolute TP price (e.g. Decimal("1.09500")). This is NOT
-            "pips distance", it is a fixed price level.
+            Absolute TP price (e.g. Decimal("1.09500")).
+        sl_price : Decimal, optional
+            Absolute SL price (e.g. Decimal("1.09000")).
         client_order_id : str, optional
             Optional client extension id for tracking in your system.
 
@@ -124,14 +137,18 @@ class BrokerClient:
 
         # Optional clientExtensions for your own tracking
         if client_order_id:
-            order_payload["order"]["clientExtensions"] = {
-                "id": client_order_id
-            }
+            order_payload["order"]["clientExtensions"] = {"id": client_order_id}
 
         # Optional Take Profit on fill
         if tp_price is not None:
             order_payload["order"]["takeProfitOnFill"] = {
-                "price": str(tp_price)
+                "price": self._fmt_price(instrument, tp_price)
+            }
+
+        # Optional Stop Loss on fill
+        if sl_price is not None:
+            order_payload["order"]["stopLossOnFill"] = {
+                "price": self._fmt_price(instrument, sl_price)
             }
 
         path = f"/accounts/{self.config.account_id}/orders"
@@ -157,13 +174,7 @@ class BrokerClient:
         Convenience helper to return current balance and available margin
         as Decimals.
 
-        Returns
-        -------
-        Dict[str, Decimal]
-            {
-                "balance": Decimal(...),
-                "margin_available": Decimal(...)
-            }
+        Updates public_module.balance and public_module.margin_available.
         """
         logger.info("Getting account summary from broker...")
 
@@ -175,7 +186,6 @@ class BrokerClient:
             margin_available = Decimal(account["marginAvailable"])
             public_module.balance = balance
             public_module.margin_available = margin_available
-            
         except KeyError as exc:
             raise RuntimeError(f"Missing expected key in OANDA account summary: {exc}") from exc
 
@@ -203,12 +213,6 @@ def create_client_from_env() -> BrokerClient:
     Optional env vars:
         OANDA_ENV      -> "practice" / "demo" / "live"
         OANDA_BASE_URL -> if provided, overrides the default URL resolved from OANDA_ENV
-
-    Defaults:
-        OANDA_ENV="practice"
-        base_url:
-            practice -> https://api-fxpractice.oanda.com/v3
-            live     -> https://api-fxtrade.oanda.com/v3
     """
     api_key = os.environ.get("OANDA_API_KEY")
     account_id = os.environ.get("OANDA_ACCOUNT_ID")
@@ -231,7 +235,6 @@ def create_client_from_env() -> BrokerClient:
             base_url = "https://api-fxtrade.oanda.com/v3"
             env_label = "live"
         else:
-            # Fallback to practice
             base_url = "https://api-fxpractice.oanda.com/v3"
             env_label = "demo"
         env = env_label

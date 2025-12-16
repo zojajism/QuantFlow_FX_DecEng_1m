@@ -120,6 +120,7 @@ def send_market_order(
     side: str,
     units: int,
     tp_price: Optional[Decimal] = None,
+    sl_price: Optional[Decimal] = None,
     client_order_id: Optional[str] = None,
 ) -> OrderExecutionResult:
     """
@@ -134,11 +135,12 @@ def send_market_order(
     client = get_broker_client()
 
     logger.info(
-        "Sending market order: symbol=%s side=%s units=%s tp_price=%s env=%s",
+        "Sending market order: symbol=%s side=%s units=%s tp_price=%s sl_price=%s env=%s",
         symbol,
         side,
         units,
         tp_price,
+        sl_price,
         client.config.env,
     )
 
@@ -148,6 +150,7 @@ def send_market_order(
         side=side,
         units=units,
         tp_price=tp_price,
+        sl_price=sl_price,
         client_order_id=client_order_id,
     )
     after = datetime.now(timezone.utc)

@@ -66,6 +66,9 @@ def is_signal_confirmed_by_correlation(
       - Missing data in either timeframe => confirming symbol fails.
       - We require at least 3 confirming symbols that pass.
     """
+    if not public_module.CORRELATION_CHECK:
+        return True
+    
     cache_5m = public_module.correlation_cache.get("5m", {})
     cache_15m = public_module.correlation_cache.get("15m", {})
 

@@ -22,7 +22,7 @@ from database.db_general import get_pg_conn
 from public_module import config_data
 from orders.order_executor import update_account_summary
 from strategy.fx_correlation import refresh_correlation_cache
-
+from indicators.atr_15m import ATR_Update, get_latest_atr_15m
 
 Candle_SUBJECT = "candles.>"   
 Candle_STREAM = "STREAM_CANDLES"   
@@ -199,6 +199,27 @@ async def main():
                             
                             key = Keys(exchange, symbol, timeframe)
                             buffers.CANDLE_BUFFER.append(key, candle_data)
+
+                            logger.info(
+                                        f"[ATR DEBUG main] tf={timeframe} close_time={candle_data['close_time']} "
+                                        f"buf_len={buffers.CANDLE_BUFFER.get_len(key)}"
+                                    )
+                                                                
+                            updated = ATR_Update(exchange, symbol, candle_data["close_time"])
+
+                            logger.info(
+                                        f"[ATR DEBUG main] updated={updated} tf={timeframe} close_time={candle_data['close_time']}"
+                                    )
+                                                                
+                            # ------------------------------------ for log and review-------------------
+                            if updated:
+                                atr = get_latest_atr_15m(exchange, symbol)
+                                if atr is not None:
+                                    logger.info(
+                                        f"[ATR TRACE] {exchange} {symbol} ATR(15m,14) = {atr:.6f} "
+                                        f"asof={candle_data['close_time']}"
+                                    )
+                            # --------------------------------------------------------------------------
 
                             on_candle_closed(exchange, symbol, timeframe, candle_data["close_time"])
                         #========== Main section, getting the candles we need ====================================

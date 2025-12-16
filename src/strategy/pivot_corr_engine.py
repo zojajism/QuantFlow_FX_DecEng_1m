@@ -24,6 +24,7 @@ from pivots.pivot_registry_provider import get_pivot_registry
 # Cross-trigger signal dedup
 from signals.signal_registry import get_signal_registry
 
+from indicators.atr_15m import get_latest_atr_15m
 from telegram_notifier import notify_telegram, ChatType
 
 from buffers.tick_registry_provider import get_tick_registry
@@ -56,6 +57,52 @@ NEWS_BLOCK_WINDOW_MIN = int(config_data.get("NEWS_BLOCK_WINDOW_MIN", 30)[0])
 
 logger = logging.getLogger(__name__)
 
+def calc_structural_sl(
+    exchange: str,
+    symbol: str,
+    signal_side: str,        # "BUY" / "SELL"
+    entry_price: float,
+) -> Tuple[float, float]:
+    """
+    Returns (sl_price, sl_pips).
+
+    Rule:
+      sl_pips = max(public_module.K_ATR * ATR(15m,14) in pips,
+                    public_module.MIN_SL_PIPS)
+
+    ATR is read from IndicatorBuffer via get_latest_atr_15m().
+    If ATR is not available -> fallback to MIN_SL_PIPS.
+    """
+    min_sl_pips = float(public_module.MIN_SL_PIPS)
+    k_atr = float(public_module.K_ATR)
+
+    pip = float(_pip_size(symbol))
+    if pip <= 0:
+        raise ValueError(f"Invalid pip size for symbol={symbol}")
+
+    atr = get_latest_atr_15m(exchange, symbol)  # ATR in price units (e.g., 0.00036)
+    if atr is None:
+        sl_pips = min_sl_pips
+    else:
+        atr_f = float(atr)
+        if atr_f <= 0:
+            sl_pips = min_sl_pips
+        else:
+            atr_pips = atr_f / pip
+            sl_pips = max(k_atr * atr_pips, min_sl_pips)
+
+    side = signal_side.upper().strip()
+    if side not in ("BUY", "SELL"):
+        raise ValueError(f"signal_side must be BUY/SELL, got: {signal_side}")
+
+    entry = float(entry_price)
+
+    if side == "BUY":
+        sl_price = entry - (sl_pips * pip)
+    else:  # SELL
+        sl_price = entry + (sl_pips * pip)
+
+    return sl_price, sl_pips
 
 def truncate(value: float, decimals: int) -> float:
     factor = 10 ** decimals
@@ -520,6 +567,21 @@ def run_decision_event(
                         reject_reason = reject_reason + 'hit_timing, '
 
                     #*****************************************************************************************************************************
+                    # --------------------------- Calculating the SL -----------------------
+
+                    # 1) Compute SL price using ATR-based rule (returns float price + float pips)
+                    sl_price_f, sl_pips = calc_structural_sl(
+                        exchange=exchange,
+                        symbol=tgt,          # "EUR/USD"
+                        signal_side=side,    # "BUY"/"SELL"
+                        entry_price=float(position_price),
+                    )
+
+                    # 2) Convert to Decimal for broker layer
+                    sl_price = Decimal(str(sl_price_f))
+
+                    # ----------------------------------------------------------------------
+
                     reject_by_pips = target_pips <= spread
                     if reject_by_pips:
                         reject_reason = reject_reason + 'pips,'
@@ -560,7 +622,7 @@ def run_decision_event(
                             reject_reason = reject_reason + 'news, '
                             break
 
-                    if not public_module.allow_trade_session_utc(event_time):
+                    if public_module.FILTER_MARKET_TIME and (not public_module.allow_trade_session_utc(event_time) or not public_module.allow_trade_session_utc(tgt_pivot_time)):
                         reject_by_market_time = True
                         reject_reason = reject_reason + 'market_time, '
 
@@ -581,6 +643,8 @@ def run_decision_event(
                         f"event_time={event_time} | target={tgt} | side={side} | "
                         f"position_price={truncate(position_price,5)} | target_price={truncate(target_price,5)} | "
                         f"target_pips={truncate(target_pips,2)} (raw={truncate(target_pips_raw,2)}) | "
+                        f"sl_pips={truncate(sl_pips,2)} | "
+                        f"sl_price={truncate(sl_price,5)} | "
                         f"spread={truncate(spread,1)} | "
                         f"mergine_required=${mergine_required} |"
                         f"confirm_symbols=[{confirm_syms_str}] | "
@@ -592,7 +656,7 @@ def run_decision_event(
                         f"send_to_broker={send_to_broker}"
                     )
 
-                    if not send_to_broker:
+                    if not send_to_broker and (reject_by_pips == False):
                         try:
                             if tgt == "USD/JPY":
                                 profit_est = (DEFAULT_ORDER_UNITS * target_pips / 100)
@@ -609,6 +673,8 @@ def run_decision_event(
                                 f"Target price:   {truncate(target_price,5)}\n"
                                 f"Distance:       {truncate(target_pips,2)} pips\n"
                                 f"Spread:         {truncate(spread,1)}\n"
+                                f"SL_Pips:         {truncate(sl_pips,2)}\n"
+                                f"SL_Price:         {truncate(sl_price,5)}\n"
                                 f"Est. Profit:    ${truncate(profit_est,2)}\n\n"
                                 f"Ref pivot:      {ref_symbol}  ({ref_type})\n"
                                 f"Ref pivot time:       {pivot_time.strftime('%Y-%m-%d %H:%M')}\n\n"
@@ -629,13 +695,17 @@ def run_decision_event(
                             )
                             order_units = DEFAULT_ORDER_UNITS
 
-                            logger.info(f"[ORDER] Sending market order: instrument={instrument}, side={side}, units={order_units}, tp_price={target_price}")
+                            logger.info(
+                                        f"[ORDER] Sending market order: instrument={instrument}, side={side}, units={order_units}, "
+                                        f"tp_price={target_price}, sl_price={sl_price}"
+                                    )
 
                             order_info = send_market_order(
                                 symbol=instrument,
                                 side=side,
                                 units=order_units,
                                 tp_price=target_price,
+                                sl_price=sl_price,
                                 client_order_id=client_order_id,
                             )
                         except requests.HTTPError as e:
@@ -678,6 +748,8 @@ def run_decision_event(
                                         f"Target price:   {truncate(target_price,5)}\n"
                                         f"Distance:       {truncate(target_pips,2)} pips\n"
                                         f"Spread:         {truncate(spread,1)}\n"
+                                        f"SL_Pips:        {truncate(sl_pips,2)}\n"
+                                        f"SL_Price:       {truncate(sl_price,5)}\n"
                                         f"Est. Profit:    ${truncate(profit_est,2)}\n\n"
                                         f"Ref pivot:      {ref_symbol}  ({ref_type})\n"
                                         f"Ref pivot time:    {pivot_time.strftime('%Y-%m-%d %H:%M')}\n\n"
@@ -752,6 +824,8 @@ def run_decision_event(
                                 f"Target price:   {truncate(target_price,5)}\n"
                                 f"Distance:       {truncate(target_pips,2)} pips\n"
                                 f"Spread:         {truncate(spread,2)}\n"
+                                f"SL_Pips:        {truncate(sl_pips,2)}\n"
+                                f"SL_Price:       {truncate(sl_price,5)}\n"
                                 f"mergine_required: ${mergine_required}\n"
                                 f"Est. Profit:    ${truncate(profit_est,2)}\n\n"
                                 f"Ref pivot:      {ref_symbol}  ({ref_type})\n"
@@ -813,6 +887,8 @@ def run_decision_event(
                             found_at_minute,        # found_at (target pivot time)
                             reject_reason,          # reject_reason
                             spread,                 # spread
+                            sl_pips,                # sl_pips
+                            sl_price,               # sl_price
                         ))
 
     # ----------------------------------------------------------------
@@ -971,8 +1047,10 @@ def _insert_signals(conn: psycopg.Connection, rows: List[tuple]) -> None:
             pivot_time,
             found_at,
             reject_reason,
-            spread
-        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            spread,
+            sl_pips,
+            sl_price
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """
     try:
         with conn.cursor() as cur:
