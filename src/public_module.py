@@ -22,7 +22,9 @@ K_ATR= 1.2
 
 CORRELATION_CHECK= False
 
-FILTER_MARKET_TIME= True
+FILTER_MARKET_TIME= False
+
+APPLY_SL= False
 
 # Type:
 #   correlation_cache[timeframe][(sym_a, sym_b)] = corr_value
@@ -55,7 +57,9 @@ K_ATR = config_data.get("K_ATR", 1.2)
 
 CORRELATION_CHECK = config_data.get("CORRELATION_CHECK", False)
 
-FILTER_MARKET_TIME = config_data.get("FILTER_MARKET_TIME", True)
+FILTER_MARKET_TIME = config_data.get("FILTER_MARKET_TIME", False)
+
+APPLY_SL = config_data.get("APPLY_SL", False)
 
 # preparing the margine list
 # This section is a list of 1-key dictionaries → convert to normal dict
@@ -133,7 +137,7 @@ def allow_trade_session_utc(dt_utc: datetime) -> bool:
 
     return in_london or in_ny
 '''
-
+'''
 def allow_trade_session_utc(dt_utc: datetime) -> bool:
     """
     Allow trades only during:
@@ -160,3 +164,37 @@ def allow_trade_session_utc(dt_utc: datetime) -> bool:
     # London trading window: 08:00–17:00 local London time
     t = london.time()
     return time(8, 0) <= t < time(17, 0)
+'''
+
+from datetime import datetime, time, timezone
+from zoneinfo import ZoneInfo
+
+
+def allow_trade_session_utc(dt_utc: datetime) -> bool:
+    """
+    Return False ONLY when:
+      - It is Friday
+      - AND London session is finished (>= 17:00 London time)
+
+    Otherwise:
+      - Always True
+
+    Input:
+      - dt_utc can be naive (assumed UTC) or tz-aware.
+    """
+
+    # Normalize to aware UTC
+    if dt_utc.tzinfo is None:
+        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+    else:
+        dt_utc = dt_utc.astimezone(timezone.utc)
+
+    # Convert to London time
+    london = dt_utc.astimezone(ZoneInfo("Europe/London"))
+
+    # Friday = 4
+    if london.weekday() == 4:
+        if london.time() >= time(17, 0):
+            return False
+
+    return True

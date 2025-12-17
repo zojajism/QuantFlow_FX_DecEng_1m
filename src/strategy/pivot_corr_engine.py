@@ -57,6 +57,8 @@ NEWS_BLOCK_WINDOW_MIN = int(config_data.get("NEWS_BLOCK_WINDOW_MIN", 30)[0])
 
 logger = logging.getLogger(__name__)
 
+fmt = lambda v, n: "N/A" if v is None else truncate(v, n)
+
 def calc_structural_sl(
     exchange: str,
     symbol: str,
@@ -139,6 +141,7 @@ def blocked_by_news(conn: Optional[psycopg.Connection], currency: str) -> bool:
          WHERE affected_currency = %s
            AND event_time_utc BETWEEN %s AND %s
            AND status = 'scheduled'
+           and is_high_impact = True
          LIMIT 1
     """
 
@@ -570,16 +573,19 @@ def run_decision_event(
                     # --------------------------- Calculating the SL -----------------------
 
                     # 1) Compute SL price using ATR-based rule (returns float price + float pips)
-                    sl_price_f, sl_pips = calc_structural_sl(
-                        exchange=exchange,
-                        symbol=tgt,          # "EUR/USD"
-                        signal_side=side,    # "BUY"/"SELL"
-                        entry_price=float(position_price),
-                    )
+                    if public_module.APPLY_SL:
+                        sl_price_f, sl_pips = calc_structural_sl(
+                            exchange=exchange,
+                            symbol=tgt,          # "EUR/USD"
+                            signal_side=side,    # "BUY"/"SELL"
+                            entry_price=float(position_price),
+                        )
 
-                    # 2) Convert to Decimal for broker layer
-                    sl_price = Decimal(str(sl_price_f))
-
+                        # 2) Convert to Decimal for broker layer
+                        sl_price = Decimal(str(sl_price_f))
+                    else:
+                        sl_price = None
+                        sl_pips = None
                     # ----------------------------------------------------------------------
 
                     reject_by_pips = target_pips <= spread
@@ -622,7 +628,8 @@ def run_decision_event(
                             reject_reason = reject_reason + 'news, '
                             break
 
-                    if public_module.FILTER_MARKET_TIME and (not public_module.allow_trade_session_utc(event_time) or not public_module.allow_trade_session_utc(tgt_pivot_time)):
+                    #if not public_module.allow_trade_session_utc(event_time) or not public_module.allow_trade_session_utc(tgt_pivot_time):
+                    if not public_module.allow_trade_session_utc(event_time):
                         reject_by_market_time = True
                         reject_reason = reject_reason + 'market_time, '
 
@@ -643,8 +650,8 @@ def run_decision_event(
                         f"event_time={event_time} | target={tgt} | side={side} | "
                         f"position_price={truncate(position_price,5)} | target_price={truncate(target_price,5)} | "
                         f"target_pips={truncate(target_pips,2)} (raw={truncate(target_pips_raw,2)}) | "
-                        f"sl_pips={truncate(sl_pips,2)} | "
-                        f"sl_price={truncate(sl_price,5)} | "
+                        f"sl_pips={fmt(sl_pips,2)} | "
+                        f"sl_price={fmt(sl_price,5)} | "
                         f"spread={truncate(spread,1)} | "
                         f"mergine_required=${mergine_required} |"
                         f"confirm_symbols=[{confirm_syms_str}] | "
@@ -673,8 +680,8 @@ def run_decision_event(
                                 f"Target price:   {truncate(target_price,5)}\n"
                                 f"Distance:       {truncate(target_pips,2)} pips\n"
                                 f"Spread:         {truncate(spread,1)}\n"
-                                f"SL_Pips:         {truncate(sl_pips,2)}\n"
-                                f"SL_Price:         {truncate(sl_price,5)}\n"
+                                f"SL_Pips:         {fmt(sl_pips,2)}\n"
+                                f"SL_Price:         {fmt(sl_price,5)}\n"
                                 f"Est. Profit:    ${truncate(profit_est,2)}\n\n"
                                 f"Ref pivot:      {ref_symbol}  ({ref_type})\n"
                                 f"Ref pivot time:       {pivot_time.strftime('%Y-%m-%d %H:%M')}\n\n"
@@ -738,6 +745,7 @@ def run_decision_event(
 
                                 # Optional telegram for cancel
                                 try:
+
                                     msg = (
                                         "🆑 Order cancelled\n"
                                         f"Reason:         {reason}\n\n"
@@ -748,8 +756,8 @@ def run_decision_event(
                                         f"Target price:   {truncate(target_price,5)}\n"
                                         f"Distance:       {truncate(target_pips,2)} pips\n"
                                         f"Spread:         {truncate(spread,1)}\n"
-                                        f"SL_Pips:        {truncate(sl_pips,2)}\n"
-                                        f"SL_Price:       {truncate(sl_price,5)}\n"
+                                        f"SL_Pips:        {fmt(sl_pips,2)}\n"
+                                        f"SL_Price:       {fmt(sl_price,5)}\n"
                                         f"Est. Profit:    ${truncate(profit_est,2)}\n\n"
                                         f"Ref pivot:      {ref_symbol}  ({ref_type})\n"
                                         f"Ref pivot time:    {pivot_time.strftime('%Y-%m-%d %H:%M')}\n\n"
@@ -814,7 +822,7 @@ def run_decision_event(
                                 profit_est = profit_jpy / position_price
                             else:
                                 profit_est = (Decimal(DEFAULT_ORDER_UNITS) * target_pips) / Decimal("10000")
-
+                            
                             msg = (
                                 "⚡ Pivot Correlation Signal\n"
                                 f"Symbol:         {tgt}\n"
@@ -824,8 +832,8 @@ def run_decision_event(
                                 f"Target price:   {truncate(target_price,5)}\n"
                                 f"Distance:       {truncate(target_pips,2)} pips\n"
                                 f"Spread:         {truncate(spread,2)}\n"
-                                f"SL_Pips:        {truncate(sl_pips,2)}\n"
-                                f"SL_Price:       {truncate(sl_price,5)}\n"
+                                f"SL_Pips:        {fmt(sl_pips,2)}\n"
+                                f"SL_Price:       {fmt(sl_price,5)}\n"
                                 f"mergine_required: ${mergine_required}\n"
                                 f"Est. Profit:    ${truncate(profit_est,2)}\n\n"
                                 f"Ref pivot:      {ref_symbol}  ({ref_type})\n"
