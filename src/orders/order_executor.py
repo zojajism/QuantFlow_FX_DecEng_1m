@@ -20,6 +20,8 @@ import math
 
 import public_module
 
+from signals import open_signal_registry
+
 def truncate(value: float, decimals: int) -> float:
     factor = 10 ** decimals
     return math.trunc(value * factor) / factor
@@ -88,6 +90,34 @@ def _pips_diff(symbol: str, p1: Decimal, p2: Decimal) -> Decimal:
     """
     size = _pip_size(symbol)
     return (p1 - p2) / size
+
+
+def _is_terminal_status(status: str) -> bool:
+    """
+    Any status that means the trade is NOT open anymore.
+    Keep it simple and robust:
+      - not terminal: open, pending
+      - terminal: everything else (closed/cancelled/rejected/error/unknown/...)
+    """
+    s = (status or "").strip().lower()
+    return s not in ("open", "pending")
+
+
+def _remove_terminal_from_open_registry(*, symbol: str, side: str, event_time: datetime, final_status: str) -> None:
+    """
+    Best-effort: remove a terminal (non-open) signal from OpenSignalRegistry.
+    This is intentionally isolated so broker sync stays safe.
+    """
+    if not _is_terminal_status(final_status):
+        return
+
+
+    try:
+        open_sig_registry = open_signal_registry.get_open_signal_registry()
+        open_sig_registry.remove_by_broker(symbol=symbol, side=side, event_time=event_time)
+    except Exception as e:
+        logger.warning("[OrderSync] Failed to remove from OpenSignalRegistry: %s", e)
+
 
 
 # ----------------------------------------------------------------------
@@ -496,6 +526,14 @@ def sync_broker_orders(conn: psycopg.Connection) -> None:
                 position_type,
                 target_price,
             )
+        )
+
+        # ----------------- Terminal status -> remove from OpenSignalRegistry -----------------
+        _remove_terminal_from_open_registry(
+            symbol=symbol_str,
+            side=side,
+            event_time=event_time,
+            final_status=final_status,
         )
 
         # ----------------- Broker close Telegram (single notif) -----------------

@@ -17,7 +17,9 @@ import yaml
 from pathlib import Path
 from entry import on_candle_closed, init_entry
 from buffers.tick_registry_provider import get_tick_registry
-from signals.open_signal_registry import get_open_signal_registry
+
+from signals import open_signal_registry
+
 from database.db_general import get_pg_conn
 from public_module import config_data
 from orders.order_executor import update_account_summary
@@ -83,6 +85,12 @@ async def main():
                         })
                 )
         
+        open_sig_registry = open_signal_registry.get_open_signal_registry()
+
+        open_sig_registry.bootstrap_from_db(DB_Conn) 
+        open_count = open_sig_registry.get_count() 
+        logger.info( json.dumps({ "EventCode": 0, "Message": f"open_sig_registry initialized. open_signals={open_count}" }) )
+
         # --- Consumer 1: Tick Engine (receives NEW messages)
         try:
             await js.delete_consumer(Tick_STREAM, Tick_DURABLE_NAME)
@@ -154,7 +162,6 @@ async def main():
                             tick_registry = get_tick_registry()
                             tick_registry.update_tick(exchange, symbol, bid, ask, parsed_time)
 
-                            open_sig_registry = get_open_signal_registry()
                             open_sig_registry.process_tick_for_symbol(
                                 exchange=exchange,
                                 symbol=symbol,

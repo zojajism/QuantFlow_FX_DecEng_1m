@@ -22,6 +22,8 @@ from public_module import config_data
 
 from strategy.fx_correlation import refresh_correlation_cache
 
+from signals import open_signal_registry
+
 symbols = [str(s) for s in config_data.get("symbols", [])]
 timeframes = [str(t) for t in config_data.get("timeframes", [])]
 
@@ -247,6 +249,8 @@ def on_candle_closed(exchange: str, symbol: str, timeframe: str, close_time: Any
         #   - send Telegram for broker-closed trades
         sync_broker_orders(conn)
 
+        open_sig_registry = open_signal_registry.get_open_signal_registry()
+        open_sig_registry.flush_distance_metrics(conn) 
 
         refresh_correlation_cache()
 
