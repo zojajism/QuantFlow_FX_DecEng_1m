@@ -537,10 +537,15 @@ def sync_broker_orders(conn: psycopg.Connection) -> None:
         )
 
         # ----------------- Broker close Telegram (single notif) -----------------
+        if profit_ccy >= 0:
+            BROKER_CLOSE = "🎯 BROKER CLOSE"
+        else:
+            BROKER_CLOSE = "♨️ BROKER CLOSE"
+
         if final_status == "closed" and actual_exit_price is not None:
             try:
                 msg_lines: List[str] = [
-                    "🎯 BROKER CLOSE",
+                    f"{BROKER_CLOSE}",
                     f"Symbol:       {symbol_str}",
                     f"Side:           {side.upper()}",
                     f"Units:          {order_units}",
@@ -553,14 +558,14 @@ def sync_broker_orders(conn: psycopg.Connection) -> None:
                 ]
 
                 if profit_pips is not None:
-                    msg_lines.append(f"Pips:          {truncate(profit_pips,2)}")
+                    msg_lines.append(f"Pips:            {truncate(profit_pips,2)}")
                 if profit_ccy is not None:
-                    msg_lines.append(f"Profit:       ${truncate(profit_ccy,2)}")
+                    msg_lines.append(f"Profit:       $ {truncate(profit_ccy,2)}")
 
                 msg_lines.append("")
-                msg_lines.append(f"Event time:    {event_time}")
+                msg_lines.append(f"Event time:    {event_time.strftime('%Y-%m-%d %H:%M')}")
                 if actual_exit_time is not None:
-                    msg_lines.append(f"Close time:    {actual_exit_time.strftime('%Y-%m-%d %H:%M')}")
+                    msg_lines.append(f"Close time:     {actual_exit_time.strftime('%Y-%m-%d %H:%M')}")
 
                 notify_telegram("\n".join(msg_lines), ChatType.INFO)
             except Exception as e:

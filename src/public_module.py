@@ -26,6 +26,7 @@ FILTER_MARKET_TIME= False
 
 APPLY_SL= False
 
+
 # Type:
 #   correlation_cache[timeframe][(sym_a, sym_b)] = corr_value
 # where (sym_a, sym_b) is an unordered / canonical pair (sorted tuple).
@@ -60,6 +61,10 @@ CORRELATION_CHECK = config_data.get("CORRELATION_CHECK", False)
 FILTER_MARKET_TIME = config_data.get("FILTER_MARKET_TIME", False)
 
 APPLY_SL = config_data.get("APPLY_SL", False)
+
+
+TP_FIX_DISTANCE = config_data.get("TP_FIX_DISTANCE", 2.0)
+TP_TARGET_FOR_FIX_DISTANCE = config_data.get("TP_TARGET_FOR_FIX_DISTANCE", 20.0)
 
 # preparing the margine list
 # This section is a list of 1-key dictionaries → convert to normal dict

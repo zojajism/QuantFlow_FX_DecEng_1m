@@ -484,8 +484,10 @@ def run_decision_event(
                     # Always use absolute distance as "magnitude"
                     target_pips_abs = abs(target_pips_raw)
 
-                    # Apply 0.9 rule immediately; from now this is THE TP distance
-                    target_pips = target_pips_abs * TP_ADJUST_FACTOR
+                    if target_pips_abs >= public_module.TP_TARGET_FOR_FIX_DISTANCE:
+                        target_pips = target_pips_abs * TP_ADJUST_FACTOR
+                    else:
+                        target_pips = target_pips_abs - public_module.TP_FIX_DISTANCE
 
                     # Directional pips for price computation
                     if side_upper == "BUY":
@@ -828,19 +830,19 @@ def run_decision_event(
                                 f"Symbol:         {tgt}\n"
                                 f"Side:           {side_upper}\n"
                                 f"Price source:   {price_source}\n\n"
-                                f"Entry price:    {truncate(position_price,5)}\n"
+                                f"Entry price:     {truncate(position_price,5)}\n"
                                 f"Target price:   {truncate(target_price,5)}\n"
-                                f"Distance:       {truncate(target_pips,2)} pips\n"
+                                f"Distance:         {truncate(target_pips,2)} pips\n"
                                 f"Spread:         {truncate(spread,2)}\n"
                                 f"SL_Pips:        {fmt(sl_pips,2)}\n"
                                 f"SL_Price:       {fmt(sl_price,5)}\n"
-                                f"mergine_required: ${mergine_required}\n"
+                                f"mergine_required:   ${mergine_required}\n"
                                 f"Est. Profit:    ${truncate(profit_est,2)}\n\n"
                                 f"Ref pivot:      {ref_symbol}  ({ref_type})\n"
                                 f"Ref pivot time: {pivot_time.strftime('%Y-%m-%d %H:%M')}\n\n"
-                                f"Target pivot time: {tgt_pivot_time.strftime('%Y-%m-%d %H:%M')}\n"
-                                f"Event time:        {event_time.strftime('%Y-%m-%d %H:%M')}\n\n"
-                                f"Confirm symbols: {confirm_syms_str}"
+                                f"Target pivot time:   {tgt_pivot_time.strftime('%Y-%m-%d %H:%M')}\n"
+                                f"Event time:             {event_time.strftime('%Y-%m-%d %H:%M')}\n\n"
+                                f"Confirm symbols:   {confirm_syms_str}"
                             )
                             notify_telegram(msg, ChatType.INFO)
                         except Exception as e:
