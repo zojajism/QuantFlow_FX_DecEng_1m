@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from pathlib import Path
 import yaml
 from typing import Dict, Tuple, Optional
@@ -63,8 +64,8 @@ FILTER_MARKET_TIME = config_data.get("FILTER_MARKET_TIME", False)
 APPLY_SL = config_data.get("APPLY_SL", False)
 
 
-TP_FIX_DISTANCE = config_data.get("TP_FIX_DISTANCE", 2.0)
-TP_TARGET_FOR_FIX_DISTANCE = config_data.get("TP_TARGET_FOR_FIX_DISTANCE", 20.0)
+TP_FIX_DISTANCE = Decimal(str(config_data.get("TP_FIX_DISTANCE", "2.0")))
+TP_TARGET_FOR_FIX_DISTANCE = Decimal(str(config_data.get("TP_TARGET_FOR_FIX_DISTANCE", "20.0")))
 
 # preparing the margine list
 # This section is a list of 1-key dictionaries → convert to normal dict
