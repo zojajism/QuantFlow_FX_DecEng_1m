@@ -8,6 +8,7 @@ import threading
 
 import yaml
 
+import public_module
 from sync.symbol_close_gate import SymbolCloseGate
 from pivots.pivot_buffer import PivotBufferRegistry
 from pivots.pivot_registry_provider import get_pivot_registry  # shared singleton
@@ -211,8 +212,8 @@ def on_candle_closed(exchange: str, symbol: str, timeframe: str, close_time: Any
         n=PIVOT_SIDE_CANDLES,
         eps=1e-9,
         strict=False,
-        hit_strict=False,         # << changed
-        hit_tolerance_pips=PIVOT_HIT_TOLERANCE_PIPS,   # << new
+        hit_strict=public_module.PIVOT_HIT_STRICT,
+        hit_tolerance_pips=PIVOT_HIT_TOLERANCE_PIPS,
     )
 
 

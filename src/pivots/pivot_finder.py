@@ -12,13 +12,13 @@ def compute_pivots(
     eps: float = 1e-9,
     symbol: Optional[str] = None,
     pip_size: Optional[float] = None,
-    hit_tolerance_pips: float = 2.0,
+    hit_tolerance_pips: float,
     high_key: str = "High",
     low_key: str = "Low",
     time_key: str = "CloseTime",
     open_time_key: str = "OpenTime",
     strict: bool = False,
-    hit_strict: bool = False,
+    hit_strict: bool,
 ) -> Tuple[List[Pivot], List[Pivot]]:
     """
     Thin wrapper around detect_pivots() to map outputs into Pivot objects.

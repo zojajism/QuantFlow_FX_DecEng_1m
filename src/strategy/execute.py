@@ -35,8 +35,8 @@ def update_pivot_buffers_for_symbol(
     n: int = 5,
     eps: float = 1e-9,
     strict: bool = False,
-    hit_strict: bool = False,
-    hit_tolerance_pips: float = 2.0,   # << new
+    hit_strict: bool,
+    hit_tolerance_pips: float,
 ):
 
     """
@@ -56,7 +56,7 @@ def update_pivot_buffers_for_symbol(
         open_time_key="OpenTime",
         strict=strict,
         hit_strict=hit_strict,
-        hit_tolerance_pips=hit_tolerance_pips,   # << NEW: 2-pip “near-hit”
+        hit_tolerance_pips=hit_tolerance_pips,
     )
 
 
@@ -95,8 +95,8 @@ def execute_strategy(
     n: int = 5,
     eps: float = 1e-9,
     strict: bool = False,
-    hit_strict: bool = False,
-    hit_tolerance_pips: float = 2.0,   # << new
+    hit_strict: bool,
+    hit_tolerance_pips: float,
 ):
 
     """
@@ -123,7 +123,7 @@ def execute_strategy(
             eps=eps,
             strict=strict,
             hit_strict=hit_strict,
-            hit_tolerance_pips=hit_tolerance_pips,   # << pass through
+            hit_tolerance_pips=hit_tolerance_pips,
         )
 
 

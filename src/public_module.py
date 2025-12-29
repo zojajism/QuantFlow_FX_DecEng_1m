@@ -27,6 +27,7 @@ FILTER_MARKET_TIME= False
 
 APPLY_SL= False
 
+PIVOT_HIT_STRICT = False
 
 # Type:
 #   correlation_cache[timeframe][(sym_a, sym_b)] = corr_value
@@ -50,6 +51,8 @@ if not CONFIG_PATH.exists():
 with CONFIG_PATH.open("r", encoding="utf-8") as f:
     config_data = yaml.safe_load(f) or {}
 
+
+PIVOT_HIT_STRICT = config_data.get("PIVOT_HIT_STRICT", False)
 
 CORRELATION_SCORE = config_data.get("CORRELATION_SCORE", 60.0)
 MAX_HIT_DISTANCE_DEVIATION = config_data.get("MAX_HIT_DISTANCE_DEVIATION", 5)

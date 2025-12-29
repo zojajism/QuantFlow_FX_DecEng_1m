@@ -104,13 +104,13 @@ def detect_pivots(
     *,
     symbol: Optional[str] = None,
     pip_size: Optional[float] = None,
-    hit_tolerance_pips: float = HIT_TOLERANCE_PIPS_DEFAULT,
+    hit_tolerance_pips: float,
     high_key: str = "High",
     low_key: str = "Low",
     time_key: str = "CloseTime",
     open_time_key: str = "OpenTime",
     strict: bool = False,
-    hit_strict: bool = False,
+    hit_strict: bool,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
 
     m = len(candles)
