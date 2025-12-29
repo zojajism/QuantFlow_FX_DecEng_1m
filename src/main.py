@@ -162,16 +162,6 @@ async def main():
                             tick_registry = get_tick_registry()
                             tick_registry.update_tick(exchange, symbol, bid, ask, parsed_time)
 
-                            open_sig_registry.process_tick_for_symbol(
-                                exchange=exchange,
-                                symbol=symbol,
-                                bid=bid,
-                                ask=ask,
-                                now=parsed_time,
-                                conn=DB_Conn,   # or None if you handle DB elsewhere
-                            )
-
-
                         await msg.ack()
                 except Exception as e:
                     #logger.error(
@@ -207,6 +197,7 @@ async def main():
                             key = Keys(exchange, symbol, timeframe)
                             buffers.CANDLE_BUFFER.append(key, candle_data)
 
+                            ''' ATR Calculation and Update
                             logger.info(
                                         f"[ATR DEBUG main] tf={timeframe} close_time={candle_data['close_time']} "
                                         f"buf_len={buffers.CANDLE_BUFFER.get_len(key)}"
@@ -227,6 +218,7 @@ async def main():
                                         f"asof={candle_data['close_time']}"
                                     )
                             # --------------------------------------------------------------------------
+                            Indicator Calculation and Update '''
 
                             on_candle_closed(exchange, symbol, timeframe, candle_data["close_time"])
                         #========== Main section, getting the candles we need ====================================

@@ -590,7 +590,7 @@ def run_decision_event(
                         sl_pips = None
                     # ----------------------------------------------------------------------
 
-                    reject_by_pips = target_pips <= spread
+                    reject_by_pips = target_pips <= spread or target_pips <= public_module.TP_FIX_DISTANCE
                     if reject_by_pips:
                         reject_reason = reject_reason + 'pips,'
 
@@ -816,14 +816,16 @@ def run_decision_event(
                         )
                     )
 
+                    actual_target_pips = abs(order_info.actual_tp_price - order_info.actual_entry_price) / _pip_size(tgt) if order_info else None
+
                     # Telegram notification ONLY for broker-eligible & not-blocked signals
                     if send_to_broker:
                         try:
                             if tgt == "USD/JPY":
-                                profit_jpy = (Decimal(DEFAULT_ORDER_UNITS) * target_pips) / Decimal("100")
+                                profit_jpy = (Decimal(DEFAULT_ORDER_UNITS) * actual_target_pips) / Decimal("100")
                                 profit_est = profit_jpy / position_price
                             else:
-                                profit_est = (Decimal(DEFAULT_ORDER_UNITS) * target_pips) / Decimal("10000")
+                                profit_est = (Decimal(DEFAULT_ORDER_UNITS) * actual_target_pips) / Decimal("10000")
                             
                             msg = (
                                 "⚡ Pivot Correlation Signal\n"
@@ -832,7 +834,7 @@ def run_decision_event(
                                 f"Price source:   {price_source}\n\n"
                                 f"Entry price:     {truncate(position_price,5)}\n"
                                 f"Target price:   {truncate(target_price,5)}\n"
-                                f"Distance:         {truncate(target_pips,2)} pips\n"
+                                f"Distance:         {truncate(target_pips,2)} pips  (raw:  {truncate(target_pips_raw,2)}) (Act:  {truncate(actual_target_pips,2)})\n"
                                 f"Spread:         {truncate(spread,2)}\n"
                                 f"SL_Pips:        {fmt(sl_pips,2)}\n"
                                 f"SL_Price:       {fmt(sl_price,5)}\n"
@@ -864,6 +866,7 @@ def run_decision_event(
                             order_info.actual_entry_time, # actual_entry_time
                             order_info.actual_entry_price,# actual_entry_price
                             order_info.actual_tp_price,   # actual_tp_price
+                            actual_target_pips,           # actual_target_pips
                             None,                         # actual_exit_time
                             None,                         # actual_exit_price
                             order_info.status,            # order_status
@@ -1093,6 +1096,7 @@ def _update_signals_with_orders(
                actual_entry_time  = %s,
                actual_entry_price = %s,
                actual_tp_price    = %s,
+               actual_target_pips = %s,
                actual_exit_time   = %s,
                actual_exit_price  = %s,
                order_status       = %s,
