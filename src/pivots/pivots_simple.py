@@ -187,8 +187,8 @@ def detect_pivots(
         return float(np.min(L[s:]))
 
     if hit_strict:
-        peak_hit_fn = lambda i: bool(_future_high_after(i) > H[i])
-        low_hit_fn = lambda i: bool(_future_low_after(i) < L[i])
+        peak_hit_fn = lambda i: bool(_future_high_after(i) >= H[i])
+        low_hit_fn = lambda i: bool(_future_low_after(i) <= L[i])
         hit_tol = 0.0
     else:
         if pip_size is None:
